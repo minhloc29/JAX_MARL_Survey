@@ -100,8 +100,10 @@ class CustomTrainState(TrainState):
 def make_train(config, env):
 
     config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
+        config["TOTAL_TIMESTEPS"]
+        + config["NUM_STEPS"] * config["NUM_ENVS"]
+        - 1
+    ) // (config["NUM_STEPS"] * config["NUM_ENVS"])
 
     eps_scheduler = optax.linear_schedule(
         config["EPS_START"],
@@ -413,7 +415,7 @@ def make_train(config, env):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics, step=metrics["update_steps"])
+                    wandb.log(metrics, step=int(metrics["env_step"]))
 
                 jax.debug.callback(callback, metrics, original_seed)
 

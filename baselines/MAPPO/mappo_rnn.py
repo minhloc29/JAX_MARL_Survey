@@ -594,7 +594,7 @@ def make_train(config):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics)
+                    wandb.log(metrics, step=int(metrics["env_step"]))
 
                 jax.debug.callback(callback, metrics, original_seed)
             runner_state = (

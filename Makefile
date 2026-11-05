@@ -19,7 +19,7 @@ DOCKER_RUN_DETACHED=docker run -d --rm $(GPUS) -v ${PWD}:/home/$(MYUSER) --shm-s
 USE_CUDA = $(if $(GPUS),true,false)
 ID = $(shell id -u)
 
-.PHONY: build run test local-test workflow-test run-baseline-set
+.PHONY: build run test local-test workflow-test run-baseline-set run-baseline
 
 # make file commands
 build:
@@ -40,3 +40,6 @@ workflow-test:
 
 run-baseline-set:
 	$(DOCKER_RUN_DETACHED) python baselines/run_minimal_baseline_set.py $(ARGS)
+
+run-baseline:
+	$(DOCKER_RUN_DETACHED) python -m baselines.cli $(ARGS)

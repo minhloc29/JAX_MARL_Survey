@@ -1,0 +1,40 @@
+export WANDB_API_KEY=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
+
+
+
+python -m baselines.cli \
+  --algorithm facmac_smac \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+echo 'export WANDB_API_KEY="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"' >> ~/.bashrc
+source ~/.bashrc
+
+
+
+python -m baselines.cli \
+  --algorithm facmac_smac \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --total-timesteps 2000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+
+python -m baselines.cli \
+  --algorithm i2c \
+  --suite smax \
+  --env 2s3z \
+  --steps 128 \
+  --total-timesteps 1000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online

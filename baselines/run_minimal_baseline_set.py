@@ -37,6 +37,11 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+try:
+    from baselines.registry import ALGO_REGISTRY
+except ImportError:
+    from registry import ALGO_REGISTRY
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_LOG_DIR = REPO_ROOT / ".baseline_logs" / "runs"
 
@@ -62,39 +67,6 @@ def jaxmarl_version() -> str:
 
 
 JAXMARL_VERSION = jaxmarl_version()
-
-# Maps (algo, suite) -> (script_relpath, alg_key, alg_prefix).
-#
-# alg_key: name of the Hydra config group file under <script_dir>/config/alg/.
-#          Empty string for flat configs (IPPO/MAPPO) that bake env settings into
-#          the script's own YAML.
-# alg_prefix: Hydra key prefix for CLI overrides. "alg." for QLearning scripts
-#             that use a nested alg config group; "" for flat configs.
-ALGO_REGISTRY: dict[tuple[str, str], tuple[str, str, str]] = {
-    # MPE
-    ("ippo_ff", "mpe"): ("baselines/IPPO/ippo_ff_mpe.py", "", ""),
-    ("ippo_rnn", "mpe"): ("baselines/IPPO/ippo_rnn_mpe.py", "", ""),
-    ("mappo_rnn", "mpe"): ("baselines/MAPPO/mappo_rnn_mpe.py", "", ""),
-    ("qmix_rnn", "mpe"): ("baselines/QLearning/qmix_rnn.py", "ql_rnn_mpe", "alg."),
-    ("vdn_rnn", "mpe"): ("baselines/QLearning/vdn_rnn.py", "ql_rnn_mpe", "alg."),
-    ("vdn_ff", "mpe"): ("baselines/QLearning/vdn_ff.py", "vdn_ff_mpe", "alg."),
-    # SMAX — flat configs use MAP_NAME; QLearning nested configs use alg.MAP_NAME
-    ("ippo_rnn", "smax"): ("baselines/IPPO/ippo_rnn_smax.py", "", ""),
-    ("mappo_rnn", "smax"): ("baselines/MAPPO/mappo_rnn_smax.py", "", ""),
-    ("qmix_rnn", "smax"): ("baselines/QLearning/qmix_rnn.py", "ql_rnn_smax", "alg."),
-    ("vdn_rnn", "smax"): ("baselines/QLearning/vdn_rnn.py", "ql_rnn_smax", "alg."),
-    # Overcooked — env field is "overcooked_{layout}"; we pass ENV_KWARGS.layout
-    ("ippo_ff", "overcooked"): ("baselines/IPPO/ippo_ff_overcooked.py", "", ""),
-    ("vdn_cnn", "overcooked"): (
-        "baselines/QLearning/vdn_cnn_overcooked.py",
-        "ql_cnn_overcooked",
-        "alg.",
-    ),
-    # Hanabi — ENV_NAME is always "hanabi"; the env field is a descriptive label only
-    ("ippo_ff", "hanabi"): ("baselines/IPPO/ippo_ff_hanabi.py", "", ""),
-    ("mappo_ff", "hanabi"): ("baselines/MAPPO/mappo_ff_hanabi.py", "", ""),
-}
-
 
 def suite_env_args(suite: str, env: str, alg_prefix: str) -> list[str]:
     """CLI overrides that select the environment within a suite."""
@@ -200,6 +172,8 @@ def build_cmd(
     entity: str,
     wandb_mode: str,
     seed: int,
+    steps: int | None = None,
+    total_timesteps: int | None = None,
 ) -> list[str]:
     p = run["alg_prefix"]
     cmd = [sys.executable, str(REPO_ROOT / run["script"])]
@@ -212,6 +186,10 @@ def build_cmd(
         f"SEED={seed}",
         "NUM_SEEDS=1",
     ]
+    if steps is not None:
+        cmd.append(f"{p}NUM_STEPS={steps}")
+    if total_timesteps is not None:
+        cmd.append(f"{p}TOTAL_TIMESTEPS={total_timesteps}")
     cmd += suite_env_args(run["suite"], run["env"], p)
     return cmd
 
@@ -227,6 +205,8 @@ def run_combo(
     gpus: list[int],
     seeds_per_gpu: int,
     tag_jaxmarl_version: bool,
+    steps: int | None = None,
+    total_timesteps: int | None = None,
 ) -> tuple[str, bool, float]:
     algo_family, network = run["algo"].rsplit("_", 1)
     tags = [algo_family.upper(), network.upper(), run["env"], run["suite"].upper()]
@@ -265,6 +245,8 @@ def run_combo(
                 entity=entity,
                 wandb_mode=wandb_mode,
                 seed=seed + i,
+                steps=steps,
+                total_timesteps=total_timesteps,
             )
             tprint(f"  [{run['name']}] seed {i + 1}/{seeds} starting on GPU {gpu_id}")
             # Per-run log: interleaved stdout is unreadable across concurrent

@@ -121,8 +121,10 @@ def make_train(config):
 
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
+        config["TOTAL_TIMESTEPS"]
+        + config["NUM_STEPS"] * config["NUM_ENVS"]
+        - 1
+    ) // (config["NUM_STEPS"] * config["NUM_ENVS"])
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
@@ -426,7 +428,15 @@ def make_train(config):
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
                         **metric["loss"],
-                    }
+                    },
+                    step=min(
+                        int(
+                            metric["update_steps"]
+                            * config["NUM_ENVS"]
+                            * config["NUM_STEPS"]
+                        ),
+                        int(config["TOTAL_TIMESTEPS"]),
+                    ),
                 )
 
             metric["update_steps"] = update_steps

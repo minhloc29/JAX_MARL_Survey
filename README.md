@@ -17,7 +17,7 @@
 </p>
 
 [**Installation**](#install) | [**Quick Start**](#start) | [**Environments**](#environments) | [**Algorithms**](#algorithms) | [**Citation**](#cite)
----
+---◊
 
 <div class="collage">
     <div class="column" align="centre">
@@ -61,6 +61,48 @@ For more details, take a look at our [blog post](https://blog.foersterlab.com/ja
 <h2 name="algorithms" id="algorithms">Baseline Algorithms 🦉 </h2>
 
 We follow CleanRL's philosophy of providing single file implementations which can be found within the `baselines` directory. We use Hydra to manage our config files, with specifics explained in each algorithm's README. Most files include `wandb` logging code, this is disabled by default but can be enabled within the file's config.
+
+All registered baselines can also be launched through one CLI. The CLI passes a
+consistent seed, GPU, and WandB configuration to each algorithm:
+
+```bash
+# Run one algorithm/environment (one WandB run per seed)
+python -m baselines.cli --algorithm ippo_ff --suite mpe \
+  --env MPE_simple_spread_v3 --project jaxmarl --seeds 5 --gpus 0 1
+
+# Validate a target without starting training, or list available targets
+python -m baselines.cli --algorithm qmix_rnn --suite smax --env 2s3z --dry-run
+python -m baselines.cli --list
+
+# Run JAX-native RODE on SMAX
+python -m baselines.cli --algorithm rode --suite smax --env 2s3z \
+  --steps 128 --total-timesteps 1000000 --gpus 0
+
+# Run a JAX-native FACMAC target through the same interface
+pip install "jaxmarl[facmac]"
+python -m baselines.cli --algorithm facmac_smac --suite smax --env 2s3z \
+  --steps 128 --total-timesteps 2000000 --gpus 0
+
+# Run JAX-native I2C communication learning on MPE
+python -m baselines.cli --algorithm i2c --suite mpe --env simple_spread \
+  --steps 128 --total-timesteps 1000000 --gpus 0
+
+# Run JAX-native NDQ communication-minimizing QMIX on SMAX
+python -m baselines.cli --algorithm ndq --suite smax --env 3s5z \
+  --steps 128 --total-timesteps 2000000 --gpus 0
+```
+
+Set `WANDB_API_KEY` before using `--wandb-mode online`. Use
+`--wandb-mode disabled` for a local smoke test. The installed
+`jaxmarl-run` command is equivalent to `python -m baselines.cli`.
+FACMAC targets use the same JAX/Flax/Optax stack as the other baselines.
+`--project`, `--entity`, and `--wandb-mode` configure WandB logging. Use
+`--override KEY=VALUE` for additional baseline overrides.
+I2C uses the same CLI budget, WandB, and checkpoint options; pass
+`--checkpoint-path path/to/i2c.msgpack` to save and resume training.
+All JAX-native targets use environment timesteps as the WandB x-axis (not
+update number) and clamp the final log point to `TOTAL_TIMESTEPS`. Thus a
+run configured with `--total-timesteps 1000000` ends at timestep `1000000`.
 
 | Algorithm | Reference | README |
 | --- | --- | --- |

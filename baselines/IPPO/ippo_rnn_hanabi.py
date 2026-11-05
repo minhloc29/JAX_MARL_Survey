@@ -419,7 +419,15 @@ def make_train(config):
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
                         **metric["loss_info"],
-                    }
+                    },
+                    step=min(
+                        int(
+                            metric["update_steps"]
+                            * config["NUM_ENVS"]
+                            * config["NUM_STEPS"]
+                        ),
+                        int(config["TOTAL_TIMESTEPS"]),
+                    ),
                 )
 
             metric["update_steps"] = update_steps
