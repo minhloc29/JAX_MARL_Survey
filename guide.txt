@@ -3,7 +3,7 @@ export WANDB_API_KEY=wandb_v1_OoAsYzM258Swdk4yWEXkEvxPaga_AGcbodYB8QxbVwgmTuZXW5
 
 
 python -m baselines.cli \
-  --algorithm facmac_smac \
+  --algorithm rode \
   --suite smax \
   --env 3s5z \
   --steps 128 \
@@ -28,13 +28,24 @@ python -m baselines.cli \
   --wandb-mode online
 
 
-
+XLA_PYTHON_CLIENT_PREALLOCATE=true \ 
 python -m baselines.cli \
   --algorithm i2c \
   --suite smax \
-  --env 2s3z \
+  --env 3s5z \
   --steps 128 \
-  --total-timesteps 1000000 \
+  --total-timesteps 5000000 \
   --gpus 0 \
   --project jaxmarl \
+  --wandb-mode online
+
+
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm rode \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
   --wandb-mode online

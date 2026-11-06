@@ -4,6 +4,7 @@ ALGO_REGISTRY: dict[tuple[str, str], tuple[str, str, str]] = {
     ("ippo_ff", "mpe"): ("baselines/IPPO/ippo_ff_mpe.py", "", ""),
     ("ippo_rnn", "mpe"): ("baselines/IPPO/ippo_rnn_mpe.py", "", ""),
     ("i2c", "mpe"): ("baselines/I2C/i2c_mpe.py", "i2c_mpe", "alg."),
+    ("i2c", "smax"): ("baselines/I2C/i2c_smax.py", "i2c_smax", "alg."),
     ("mappo_rnn", "mpe"): ("baselines/MAPPO/mappo_rnn_mpe.py", "", ""),
     ("qmix_rnn", "mpe"): ("baselines/QLearning/qmix_rnn.py", "ql_rnn_mpe", "alg."),
     ("vdn_rnn", "mpe"): ("baselines/QLearning/vdn_rnn.py", "ql_rnn_mpe", "alg."),

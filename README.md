@@ -63,7 +63,9 @@ For more details, take a look at our [blog post](https://blog.foersterlab.com/ja
 We follow CleanRL's philosophy of providing single file implementations which can be found within the `baselines` directory. We use Hydra to manage our config files, with specifics explained in each algorithm's README. Most files include `wandb` logging code, this is disabled by default but can be enabled within the file's config.
 
 All registered baselines can also be launched through one CLI. The CLI passes a
-consistent seed, GPU, and WandB configuration to each algorithm:
+consistent seed, GPU, parallel-environment, timestep, and WandB configuration
+to each algorithm. SMAX defaults to the standard `3s5z` map, with 16 parallel
+environments and GPU preallocation enabled:
 
 ```bash
 # Run one algorithm/environment (one WandB run per seed)
@@ -87,9 +89,16 @@ python -m baselines.cli --algorithm facmac_smac --suite smax --env 2s3z \
 python -m baselines.cli --algorithm i2c --suite mpe --env simple_spread \
   --steps 128 --total-timesteps 1000000 --gpus 0
 
+# Run JAX-native I2C communication learning on SMAX
+python -m baselines.cli --algorithm i2c --suite smax --env 3s5z \
+  --num-envs 16 --steps 128 --total-timesteps 5000000 --seeds 5 --gpus 0
+
 # Run JAX-native NDQ communication-minimizing QMIX on SMAX
 python -m baselines.cli --algorithm ndq --suite smax --env 3s5z \
-  --steps 128 --total-timesteps 2000000 --gpus 0
+  --steps 128 --num-envs 16 --total-timesteps 2000000 --gpus 0
+
+# Run every registered JAX SMAX target on the standard 3s5z map
+python -m baselines.cli --algorithm all --total-timesteps 1000000 --gpus 0
 ```
 
 Set `WANDB_API_KEY` before using `--wandb-mode online`. Use

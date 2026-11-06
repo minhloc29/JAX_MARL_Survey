@@ -174,6 +174,7 @@ def build_cmd(
     seed: int,
     steps: int | None = None,
     total_timesteps: int | None = None,
+    num_envs: int | None = None,
 ) -> list[str]:
     p = run["alg_prefix"]
     cmd = [sys.executable, str(REPO_ROOT / run["script"])]
@@ -190,6 +191,8 @@ def build_cmd(
         cmd.append(f"{p}NUM_STEPS={steps}")
     if total_timesteps is not None:
         cmd.append(f"{p}TOTAL_TIMESTEPS={total_timesteps}")
+    if num_envs is not None:
+        cmd.append(f"{p}NUM_ENVS={num_envs}")
     cmd += suite_env_args(run["suite"], run["env"], p)
     return cmd
 
@@ -207,6 +210,7 @@ def run_combo(
     tag_jaxmarl_version: bool,
     steps: int | None = None,
     total_timesteps: int | None = None,
+    num_envs: int | None = None,
 ) -> tuple[str, bool, float]:
     algo_family, network = run["algo"].rsplit("_", 1)
     tags = [algo_family.upper(), network.upper(), run["env"], run["suite"].upper()]
@@ -232,10 +236,8 @@ def run_combo(
         try:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            # Always disable preallocation, not just when sharing a GPU. With it
-            # on, a lone run still grabs 75% of the card (~18.4GB of 24GB) which
-            # barely covers a full-scale SMAX run and OOMs on any spike.
-            env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+            # Preallocation keeps compiled JAX workloads on the accelerator.
+            env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
             env["WANDB_TAGS"] = wandb_tags
             env["WANDB_RUN_GROUP"] = wandb_group
             env["WANDB_NAME"] = f"{wandb_group}-{i + 1}"
@@ -247,6 +249,7 @@ def run_combo(
                 seed=seed + i,
                 steps=steps,
                 total_timesteps=total_timesteps,
+                num_envs=num_envs,
             )
             tprint(f"  [{run['name']}] seed {i + 1}/{seeds} starting on GPU {gpu_id}")
             # Per-run log: interleaved stdout is unreadable across concurrent

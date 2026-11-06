@@ -67,9 +67,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run one or more JaxMARL baseline algorithms with WandB logging."
     )
-    parser.add_argument("--algorithm", "-a")
-    parser.add_argument("--suite")
-    parser.add_argument("--env", help="Environment/map name understood by the suite.")
+    parser.add_argument(
+        "--algorithm",
+        "-a",
+        help="Algorithm name or 'all' for every registered SMAX algorithm.",
+    )
+    parser.add_argument(
+        "--suite",
+        default="smax",
+        help="Benchmark suite (default: smax).",
+    )
+    parser.add_argument(
+        "--env",
+        default=None,
+        help="Environment/map name (default for SMAX: 3s5z).",
+    )
     parser.add_argument("--project", default=os.environ.get("WANDB_PROJECT", "jaxmarl"))
     parser.add_argument("--entity", default=os.environ.get("WANDB_ENTITY", ""))
     parser.add_argument(
@@ -92,6 +104,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1_000_000,
         help="Training environment timesteps (default: 1000000).",
+    )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=16,
+        help="Parallel environments for JAX targets (default: 16).",
     )
     parser.add_argument("--checkpoint-path", help="Checkpoint file to save or resume.")
     parser.add_argument(
@@ -127,17 +145,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.list_targets:
         return args
+    if args.env is None and args.suite == "smax":
+        args.env = "3s5z"
     missing = [
         option
-        for option, value in (("--algorithm", args.algorithm), ("--suite", args.suite), ("--env", args.env))
+        for option, value in (
+            ("--algorithm", args.algorithm),
+            ("--suite", args.suite),
+            ("--env", args.env),
+        )
         if value is None
     ]
     if missing:
         parser.error("the following arguments are required: " + ", ".join(missing))
     if args.seeds < 1 or args.seeds_per_gpu < 1:
         parser.error("--seeds and --seeds-per-gpu must be positive")
-    if args.steps < 1 or args.total_timesteps < 1 or args.checkpoint_interval < 1:
-        parser.error("--steps, --total-timesteps, and --checkpoint-interval must be positive")
+    if (
+        args.steps < 1
+        or args.total_timesteps < 1
+        or args.checkpoint_interval < 1
+        or (args.num_envs is not None and args.num_envs < 1)
+    ):
+        parser.error(
+            "--steps, --total-timesteps, --checkpoint-interval, and --num-envs "
+            "must be positive"
+        )
     return args
 
 
@@ -231,6 +263,7 @@ def _run_jax_facmac(
     gpus: list[int],
     steps: int | None,
     total_timesteps: int,
+    num_envs: int | None,
     checkpoint_path: str | None,
     checkpoint_interval: int,
 ) -> bool:
@@ -252,10 +285,12 @@ def _run_jax_facmac(
             f"CHECKPOINT_PATH={checkpoint_path or ''}",
             f"CHECKPOINT_INTERVAL={checkpoint_interval}",
         ]
+        if num_envs is not None:
+            command.append(f"alg.NUM_ENVS={num_envs}")
         command += _jax_suite_env_args(run["suite"], run["env"], run["alg_prefix"])
         environment = os.environ.copy()
         environment["CUDA_VISIBLE_DEVICES"] = str(gpus[index % len(gpus)])
-        environment["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+        environment["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
         environment["WANDB_RUN_GROUP"] = f"{run['algo']}-{run['env']}"
         environment["WANDB_NAME"] = f"{run['algo']}-{run['env']}-{index + 1}"
         print(
@@ -275,6 +310,58 @@ def main(argv: list[str] | None = None) -> int:
             family = "facmac" if (algorithm, suite) in FACMAC_REGISTRY else "jaxmarl"
             print(f"{algorithm:<18} {suite:<12} {family}")
         return 0
+    if args.algorithm == "all":
+        algorithms = sorted(
+            algorithm
+            for algorithm, suite in ALGO_REGISTRY
+            if suite == args.suite and algorithm != "ndo"
+        )
+        if not algorithms:
+            print(f"ERROR: no registered algorithms for suite '{args.suite}'", file=sys.stderr)
+            return 1
+        forwarded = [
+            "--suite",
+            args.suite,
+            "--env",
+            args.env,
+            "--project",
+            args.project,
+            "--entity",
+            args.entity,
+            "--wandb-mode",
+            args.wandb_mode,
+            "--seed",
+            str(args.seed),
+            "--seeds",
+            str(args.seeds),
+            "--gpus",
+            *[str(gpu) for gpu in args.gpus],
+            "--seeds-per-gpu",
+            str(args.seeds_per_gpu),
+            "--steps",
+            str(args.steps),
+            "--total-timesteps",
+            str(args.total_timesteps),
+            "--num-envs",
+            str(args.num_envs),
+            "--checkpoint-interval",
+            str(args.checkpoint_interval),
+        ]
+        if args.checkpoint_path:
+            forwarded += ["--checkpoint-path", args.checkpoint_path]
+        if args.no_version_tag:
+            forwarded.append("--no-version-tag")
+        if args.dry_run:
+            forwarded.append("--dry-run")
+        passed = True
+        for algorithm in algorithms:
+            print(
+                f"Running standard SMAX target {algorithm} "
+                f"on {args.env} with {args.num_envs} parallel environments",
+                flush=True,
+            )
+            passed = main(["--algorithm", algorithm, *forwarded]) == 0 and passed
+        return 0 if passed else 1
 
     run = _registry_run(ALGO_REGISTRY, args.algorithm, args.suite, args.env)
     facmac_run = _facmac_run(args.algorithm, args.suite, args.env)
@@ -313,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
                 gpus=args.gpus,
                 steps=args.steps,
                 total_timesteps=args.total_timesteps,
+                num_envs=args.num_envs,
                 checkpoint_path=args.checkpoint_path,
                 checkpoint_interval=args.checkpoint_interval,
             )
@@ -335,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         tag_jaxmarl_version=not args.no_version_tag,
         steps=args.steps,
         total_timesteps=args.total_timesteps,
+        num_envs=args.num_envs,
     )
     return 0 if passed else 1
 
