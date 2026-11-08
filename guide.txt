@@ -28,7 +28,7 @@ python -m baselines.cli \
   --wandb-mode online
 
 
-XLA_PYTHON_CLIENT_PREALLOCATE=true \ 
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
 python -m baselines.cli \
   --algorithm i2c \
   --suite smax \
@@ -48,4 +48,52 @@ python -m baselines.cli \
   --steps 128 \
   --total-timesteps 5000000 \
   --gpus 0 \
+  --wandb-mode online
+
+
+# ====================================================
+# 1. MAT (Multi-Agent Transformer) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm mat \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+# ====================================================
+# 2. DCG (Deep Coordination Graphs) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm dcg \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+# ====================================================
+# 3. DICG (Deep Implicit Coordination Graphs) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm dicg \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
   --wandb-mode online

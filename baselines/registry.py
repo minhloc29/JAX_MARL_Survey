@@ -33,6 +33,12 @@ ALGO_REGISTRY: dict[tuple[str, str], tuple[str, str, str]] = {
     ): ("baselines/QLearning/vdn_cnn_overcooked.py", "ql_cnn_overcooked", "alg."),
     ("ippo_ff", "hanabi"): ("baselines/IPPO/ippo_ff_hanabi.py", "", ""),
     ("mappo_ff", "hanabi"): ("baselines/MAPPO/mappo_ff_hanabi.py", "", ""),
+    ("mat", "smax"): ("baselines/MAT/mat_smax.py", "", ""),
+    ("mat_smax", "smax"): ("baselines/MAT/mat_smax.py", "", ""),
+    ("dcg", "smax"): ("baselines/DCG/dcg_smax.py", "", ""),
+    ("dcg_smax", "smax"): ("baselines/DCG/dcg_smax.py", "", ""),
+    ("dicg", "smax"): ("baselines/DICG/dicg_smax.py", "", ""),
+    ("dicg_smax", "smax"): ("baselines/DICG/dicg_smax.py", "", ""),
 }
 
 # FACMAC uses its native Sacred/PyTorch runner.  The tuple contains the

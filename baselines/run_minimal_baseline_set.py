@@ -212,8 +212,11 @@ def run_combo(
     total_timesteps: int | None = None,
     num_envs: int | None = None,
 ) -> tuple[str, bool, float]:
-    algo_family, network = run["algo"].rsplit("_", 1)
-    tags = [algo_family.upper(), network.upper(), run["env"], run["suite"].upper()]
+    if "_" in run["algo"]:
+        algo_family, network = run["algo"].rsplit("_", 1)
+        tags = [algo_family.upper(), network.upper(), run["env"], run["suite"].upper()]
+    else:
+        tags = [run["algo"].upper(), run["env"], run["suite"].upper()]
     if tag_jaxmarl_version:
         tags.append(f"jaxmarl-{JAXMARL_VERSION}")
     wandb_tags = ",".join(tags)
