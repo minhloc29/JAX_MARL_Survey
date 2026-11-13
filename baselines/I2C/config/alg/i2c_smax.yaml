@@ -1,0 +1,21 @@
+LR: 0.0003
+NUM_STEPS: 128
+TOTAL_TIMESTEPS: 1000000
+NUM_ENVS: 16
+GAMMA: 0.99
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 0.5
+HIDDEN_DIM: 128
+ENV_NAME: HeuristicEnemySMAX
+MAP_NAME: 3s5z
+ENV_KWARGS:
+  see_enemy_actions: true
+  walls_cause_death: true
+  attack_mode: closest
+SEED: 0
+PROJECT: jaxmarl
+ENTITY: ""
+WANDB_MODE: disabled
+CHECKPOINT_PATH: ""
+CHECKPOINT_INTERVAL: 1
