@@ -91,7 +91,7 @@ class DecodeBlock(nn.Module):
         attn1_out = MultiHeadAttention(self.n_embd, self.n_head, masked=True)(x, x, x)
         x = nn.LayerNorm()(x + attn1_out)
 
-        attn2_out = MultiHeadAttention(self.n_embd, self.n_head, masked=False)(
+        attn2_out = MultiHeadAttention(self.n_embd, self.n_head, masked=True)(
             query=rep_enc, key=x, value=x
         )
         x = nn.LayerNorm()(rep_enc + attn2_out)
@@ -303,8 +303,16 @@ def make_train(config: dict):
         last_obs = dict_to_agent_array(obs_dict, env.agents)
         last_done = jnp.zeros(config["NUM_ENVS"], dtype=jnp.bool_)
 
+        def _log_update(metrics, update_index):
+            wandb.log(
+                {key: float(value) for key, value in metrics.items()},
+                step=int(update_index)
+                * int(config["NUM_STEPS"])
+                * int(config["NUM_ENVS"]),
+            )
+
         # 3. Main Update Loop
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, update_index):
             train_state, env_state, last_obs, last_done, rng = runner_state
 
             # --- ROLLOUT ---
@@ -463,9 +471,18 @@ def make_train(config: dict):
             # Metrics callback for WandB
             metrics = {
                 "loss": jnp.mean(loss_metrics[0]),
-                "won_rate": jnp.mean(traj_batch.info["returned_won_episode"]),
-                "returns": jnp.mean(traj_batch.info["returned_episode_returns"]),
+                "returned_won_episode": jnp.mean(
+                    traj_batch.info["returned_won_episode"]
+                ),
+                "returned_episode_returns": jnp.mean(
+                    traj_batch.info["returned_episode_returns"]
+                ),
+                "returned_episode_lengths": jnp.mean(
+                    traj_batch.info["returned_episode_lengths"]
+                ),
+                "returned_episode": jnp.mean(traj_batch.info["returned_episode"]),
             }
+            jax.debug.callback(_log_update, metrics, update_index + 1)
 
             runner_state = (train_state, env_state, last_obs, last_done, rng)
             return runner_state, metrics
@@ -473,7 +490,7 @@ def make_train(config: dict):
         # 4. Run All Updates via lax.scan
         runner_state = (train_state, env_state, last_obs, last_done, rng)
         runner_state, metrics = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
         return {"runner_state": runner_state, "metrics": metrics}
 
@@ -483,7 +500,7 @@ def make_train(config: dict):
 @hydra.main(version_base=None, config_path="config", config_name="mat_smax")
 def main(config):
     config = OmegaConf.to_container(config)
-
+123456aA@
     wandb.init(
         entity=config.get("ENTITY", None),
         project=config["WANDB_PROJECT"],
@@ -495,6 +512,7 @@ def main(config):
     rng = jax.random.PRNGKey(config.get("SEED", 42))
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
+    wandb.finish()
     print("MAT training on SMAX 3s5z completed successfully!")
 
 

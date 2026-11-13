@@ -180,13 +180,27 @@ def build_cmd(
     cmd = [sys.executable, str(REPO_ROOT / run["script"])]
     if run["alg_key"]:
         cmd.append(f"+alg={run['alg_key']}")
-    cmd += [
-        f"PROJECT={project}",
-        f"ENTITY={entity}",
-        f"WANDB_MODE={wandb_mode}",
-        f"SEED={seed}",
-        "NUM_SEEDS=1",
-    ]
+    if run["script"] in {
+        "baselines/MAT/mat_smax.py",
+        "baselines/DCG/dcg_smax.py",
+        "baselines/DICG/dicg_smax.py",
+    }:
+        # These standalone configs use WANDB_PROJECT and intentionally do not
+        # declare the legacy launcher keys used by the other JAX baselines.
+        cmd += [
+            "WANDB_PROJECT=" + project,
+            f"WANDB_MODE={wandb_mode}",
+            f"+ENTITY={entity}",
+            f"+SEED={seed}",
+        ]
+    else:
+        cmd += [
+            f"PROJECT={project}",
+            f"ENTITY={entity}",
+            f"WANDB_MODE={wandb_mode}",
+            f"SEED={seed}",
+            "NUM_SEEDS=1",
+        ]
     if steps is not None:
         cmd.append(f"{p}NUM_STEPS={steps}")
     if total_timesteps is not None:

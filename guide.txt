@@ -56,7 +56,7 @@ python -m baselines.cli \
 # ====================================================
 XLA_PYTHON_CLIENT_PREALLOCATE=true \
 python -m baselines.cli \
-  --algorithm mat \
+  --algorithm i2c \
   --suite smax \
   --env 3s5z \
   --steps 128 \
@@ -88,7 +88,7 @@ python -m baselines.cli \
 # ====================================================
 XLA_PYTHON_CLIENT_PREALLOCATE=true \
 python -m baselines.cli \
-  --algorithm dicg \
+  --algorithm dcg \
   --suite smax \
   --env 3s5z \
   --steps 128 \
@@ -97,3 +97,8 @@ python -m baselines.cli \
   --gpus 0 \
   --project jaxmarl \
   --wandb-mode online
+
+
+
+
+dcg, rode, i2c: failed

@@ -1,16 +1,32 @@
-"""Deep Coordination Graphs (DCG) implemented in 100% JAX and Flax for SMAX.
+"""Deep Coordination Graphs (DCG) in JAX/Flax for SMAX (revised).
 
-Based on:
-- 'Deep Coordination Graphs' (Boehmer et al., ICML 2020)
-- Single-file baseline structure for JaxMARL
+Based on 'Deep Coordination Graphs' (Boehmer et al., ICML 2020).
+
+Changes versus the first port:
+  * Pairwise payoffs are symmetrized the way the paper does it: the SAME
+    payoff network is applied in both input orders and the results are
+    averaged (f_ij(a_i, a_j) = 0.5 * (g(h_i, h_j)[a_i, a_j] + g(h_j, h_i)[a_j, a_i])),
+    instead of forcing f_ij == f_ij^T.
+  * One-hot agent ID appended to observations (config ADD_AGENT_ID, default True).
+  * Win rate / return / length are averaged over FINISHED episodes only.
+  * Greedy (epsilon = 0) frozen-policy evaluation at the end of training.
+  * Double-Q target is computed outside the loss (no autodiff through
+    message passing).
+  * Training returns only metrics, eval and params (not the replay buffer), so
+    jax.vmap over seeds does not keep one buffer per seed on the device.
+  * Shared metric vocabulary via baselines.metrics.log_metrics, optional in-loop
+    logging (config LOG_IN_LOOP) so seeds can be vmapped.
+
+Known deviations from the original paper (list them in the deviations table):
+  * No recurrent agent network (MLP on the current observation only).
+  * Full |A| x |A| payoff matrices, not the low-rank factorization.
+  * Complete graph over agents (no sparsity / no learned graph).
+  * Time-limit truncation is treated as terminal.
 """
 
 from __future__ import annotations
 
-import functools
-import os
-import time
-from typing import Any, NamedTuple
+from typing import Any
 
 import chex
 import distrax
@@ -26,56 +42,77 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from jaxmarl import make
+from baselines.metrics import log_metrics
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def make_edges(n_agents: int) -> tuple[jax.Array, jax.Array]:
+    """Undirected complete graph, each pair (i < j) once."""
+    pairs = [(i, j) for i in range(n_agents) for j in range(i + 1, n_agents)]
+    edges_from = jnp.array([p[0] for p in pairs], dtype=jnp.int32)
+    edges_to = jnp.array([p[1] for p in pairs], dtype=jnp.int32)
+    return edges_from, edges_to
+
+
+def dict_to_agent_array(d, agent_list):
+    return jnp.stack([d[agent] for agent in agent_list], axis=1)
 
 
 # =============================================================================
 # DCG Networks (Flax Linen)
 # =============================================================================
 
+class PairPayoff(nn.Module):
+    """g(h_a, h_b) -> payoff matrix indexed [action_of_a, action_of_b]."""
+
+    hidden_dim: int
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, h_a: jax.Array, h_b: jax.Array) -> jax.Array:
+        x = jnp.concatenate([h_a, h_b], axis=-1)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.action_dim * self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
+        return x.reshape(x.shape[:-1] + (self.action_dim, self.action_dim))
+
+
 class DCGNet(nn.Module):
     action_dim: int
     n_agents: int
     hidden_dim: int = 128
+    add_agent_id: bool = True
 
     @nn.compact
     def __call__(self, obs: jax.Array) -> tuple[jax.Array, jax.Array]:
         # obs: (batch, n_agents, obs_dim)
-        batch_size = obs.shape[0]
+        if self.add_agent_id:
+            ids = jnp.broadcast_to(
+                jnp.eye(self.n_agents), obs.shape[:-2] + (self.n_agents, self.n_agents)
+            )
+            obs = jnp.concatenate([obs, ids], axis=-1)
 
-        # 1. Feature extractor per agent
         h = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(obs)
         h = nn.relu(h)
         h = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(h)
         h = nn.relu(h)  # (batch, n_agents, hidden_dim)
 
-        # 2. Unary utilities f_i
+        # Unary utilities f_i
         f_i = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(h)
 
-        # 3. Pairwise payoffs f_ij for all undirected edges (i < j)
-        edges_from = []
-        edges_to = []
-        for i in range(self.n_agents):
-            for j in range(i + 1, self.n_agents):
-                edges_from.append(i)
-                edges_to.append(j)
-
-        edges_from = jnp.array(edges_from, dtype=jnp.int32)
-        edges_to = jnp.array(edges_to, dtype=jnp.int32)
-
+        # Pairwise payoffs: one shared network, applied in both input orders
+        edges_from, edges_to = make_edges(self.n_agents)
         h_from = h[:, edges_from, :]
         h_to = h[:, edges_to, :]
-        h_pairs = jnp.concatenate([h_from, h_to], axis=-1)  # (batch, n_edges, 2*hidden_dim)
-
-        payoff_raw = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(h_pairs)
-        payoff_raw = nn.relu(payoff_raw)
-        payoff_raw = nn.Dense(self.action_dim * self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(payoff_raw)
-        f_ij = payoff_raw.reshape((batch_size, len(edges_from), self.action_dim, self.action_dim))
-
-        # Symmetrize payoffs
-        f_ij = 0.5 * (f_ij + jnp.swapaxes(f_ij, -2, -1))
+        payoff = PairPayoff(self.hidden_dim, self.action_dim, name="payoff")
+        p_fwd = payoff(h_from, h_to)  # [a_from, a_to]
+        p_bwd = payoff(h_to, h_from)  # [a_to, a_from]
+        f_ij = 0.5 * (p_fwd + jnp.swapaxes(p_bwd, -2, -1))  # [a_from, a_to]
 
         return f_i, f_ij
 
@@ -90,6 +127,7 @@ def message_passing(
     n_actions: int,
     iterations: int = 8,
 ) -> tuple[jax.Array, jax.Array]:
+    """Max-plus message passing; maximizes Q_tot = mean_i f_i + mean_edges f_ij."""
     batch_size = f_i.shape[0]
     n_edges = edges_from.shape[0]
 
@@ -154,12 +192,11 @@ def compute_q_tot(
 
 
 # =============================================================================
-# Custom Train State & Transitions
+# Training
 # =============================================================================
 
 class CustomTrainState(TrainState):
     target_params: Any
-    timesteps: int = 0
     n_updates: int = 0
 
 
@@ -174,6 +211,23 @@ class Transition:
     next_avail: jax.Array
 
 
+def finished_episode_stats(infos, num_agents: int):
+    """Average episode statistics over FINISHED episodes only.
+
+    infos leaves have shape (steps, envs, agents). The wrapper repeats the last
+    finished episode's value on every step, so each value is weighted by the
+    'returned_episode' flag (1 only on the step where an episode just ended).
+    """
+    done_ep = infos["returned_episode"].astype(jnp.float32)
+    n = jnp.maximum(done_ep.sum(), 1.0)
+    return {
+        "won_rate": (infos["returned_won_episode"] * done_ep).sum() / n,
+        "returns": (infos["returned_episode_returns"] * done_ep).sum() / n,
+        "episode_length": (infos["returned_episode_lengths"] * done_ep).sum() / n,
+        "n_episodes": done_ep.sum() / num_agents,
+    }
+
+
 def make_train(config: dict):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -182,16 +236,7 @@ def make_train(config: dict):
     num_agents = env.num_agents
     action_dim = env.action_space(env.agents[0]).n
     obs_dim = env.observation_space(env.agents[0]).shape[0]
-
-    # Precompute edge indices
-    edges_from = []
-    edges_to = []
-    for i in range(num_agents):
-        for j in range(i + 1, num_agents):
-            edges_from.append(i)
-            edges_to.append(j)
-    edges_from = jnp.array(edges_from, dtype=jnp.int32)
-    edges_to = jnp.array(edges_to, dtype=jnp.int32)
+    edges_from, edges_to = make_edges(num_agents)
 
     config["NUM_UPDATES"] = int(
         (config["TOTAL_TIMESTEPS"] + config["NUM_STEPS"] * config["NUM_ENVS"] - 1)
@@ -205,11 +250,11 @@ def make_train(config: dict):
     )
 
     def train(rng: jax.Array):
-        # 1. Initialize Network
         model = DCGNet(
             action_dim=action_dim,
             n_agents=num_agents,
             hidden_dim=config["HIDDEN_DIM"],
+            add_agent_id=config.get("ADD_AGENT_ID", True),
         )
 
         rng, rng_init = jax.random.split(rng)
@@ -220,15 +265,11 @@ def make_train(config: dict):
             optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
             optax.adam(learning_rate=config["LR"], eps=1e-5),
         )
-
         train_state = CustomTrainState.create(
-            apply_fn=model.apply,
-            params=params,
-            target_params=params,
-            tx=tx,
+            apply_fn=model.apply, params=params, target_params=params, tx=tx
         )
 
-        # 2. Initialize Buffer (Flashbax)
+        # Replay buffer (Flashbax flat buffer; add whole rollouts at once)
         dummy_trans = Transition(
             obs=jnp.zeros((num_agents, obs_dim)),
             actions=jnp.zeros((num_agents,), dtype=jnp.int32),
@@ -238,7 +279,6 @@ def make_train(config: dict):
             next_obs=jnp.zeros((num_agents, obs_dim)),
             next_avail=jnp.ones((num_agents, action_dim)),
         )
-
         buffer = fbx.make_flat_buffer(
             max_length=int(config["BUFFER_SIZE"]),
             min_length=int(config["BUFFER_BATCH_SIZE"]),
@@ -248,40 +288,44 @@ def make_train(config: dict):
         )
         buffer_state = buffer.init(dummy_trans)
 
-        # 3. Reset Environments
         rng, rng_reset = jax.random.split(rng)
         reset_rngs = jax.random.split(rng_reset, config["NUM_ENVS"])
         obs_dict, env_state = jax.vmap(env.reset)(reset_rngs)
-
-        def dict_to_agent_array(d, agent_list):
-            return jnp.stack([d[agent] for agent in agent_list], axis=1)
-
         last_obs = dict_to_agent_array(obs_dict, env.agents)
         last_done = jnp.zeros(config["NUM_ENVS"], dtype=jnp.bool_)
 
-        # 4. Training Step
+        def _log_update(metrics, update_index):
+            log_metrics(
+                {key: float(value) for key, value in metrics.items()},
+                step=int(update_index)
+                * int(config["NUM_STEPS"])
+                * int(config["NUM_ENVS"]),
+            )
+
+        def _greedy(params, obs, avail):
+            f_i, f_ij = model.apply(params, obs)
+            actions, _ = message_passing(
+                f_i, f_ij, edges_from, edges_to, avail,
+                num_agents, action_dim, iterations=config["MSG_ITERATIONS"],
+            )
+            return actions
+
         def _update_step(runner_state, update_idx):
             train_state, buffer_state, env_state, last_obs, last_done, rng = runner_state
             eps = eps_scheduler(train_state.n_updates)
 
-            # --- COLLECT ROLLOUT ---
+            # --- COLLECT ROLLOUT (epsilon-greedy) ---
             def _env_step(carry, _):
                 env_state, last_obs, last_done, rng = carry
-                rng, rng_act, rng_eps, rng_rand, rng_step = jax.random.split(rng, 5)
+                rng, rng_eps, rng_rand, rng_step = jax.random.split(rng, 4)
 
-                avail_actions_dict = jax.vmap(env.get_avail_actions)(env_state.env_state)
-                avail_actions = dict_to_agent_array(avail_actions_dict, env.agents).astype(jnp.float32)
+                avail_dict = jax.vmap(env.get_avail_actions)(env_state.env_state)
+                avail_actions = dict_to_agent_array(avail_dict, env.agents).astype(jnp.float32)
 
-                f_i, f_ij = model.apply(train_state.params, last_obs)
-                greedy_act, _ = message_passing(
-                    f_i, f_ij, edges_from, edges_to, avail_actions,
-                    num_agents, action_dim, iterations=config["MSG_ITERATIONS"]
-                )
+                greedy_act = _greedy(train_state.params, last_obs, avail_actions)
 
-                # Epsilon-greedy action selection
                 rand_logits = jnp.where(avail_actions > 0, 0.0, -1e10)
                 rand_act = distrax.Categorical(logits=rand_logits).sample(seed=rng_rand)
-
                 choose_rand = jax.random.uniform(rng_eps, greedy_act.shape) < eps
                 actions = jnp.where(choose_rand, rand_act, greedy_act)
 
@@ -307,75 +351,63 @@ def make_train(config: dict):
                     next_obs=next_obs,
                     next_avail=next_avail,
                 )
-
-                carry = (env_state, next_obs, global_done, rng)
-                return carry, (trans, infos)
+                return (env_state, next_obs, global_done, rng), (trans, infos)
 
             carry = (env_state, last_obs, last_done, rng)
             carry, (traj_trans, infos) = jax.lax.scan(_env_step, carry, None, config["NUM_STEPS"])
             env_state, last_obs, last_done, rng = carry
 
-            # Flatten across (NUM_STEPS, NUM_ENVS) and push to buffer
             flat_trans = jax.tree.map(
                 lambda x: x.reshape((config["NUM_STEPS"] * config["NUM_ENVS"],) + x.shape[2:]),
                 traj_trans,
             )
             buffer_state = buffer.add(buffer_state, flat_trans)
 
-            # --- Q-LEARNING UPDATE (EPOCHS) ---
+            # --- DOUBLE-Q UPDATES ---
             def _epoch_step(carry, _):
                 train_state, buffer_state, rng = carry
                 rng, rng_sample = jax.random.split(rng)
-
                 batch = buffer.sample(buffer_state, rng_sample).experience.first
+
+                # Target: online net selects next joint action, target net evaluates it.
+                # Computed outside the loss, so no gradient flows through message passing.
+                greedy_next = _greedy(train_state.params, batch.next_obs, batch.next_avail)
+                t_f_i, t_f_ij = model.apply(train_state.target_params, batch.next_obs)
+                q_next = compute_q_tot(t_f_i, t_f_ij, greedy_next, edges_from, edges_to)
+                team_reward = jnp.mean(batch.rewards, axis=-1)
+                not_done = 1.0 - batch.dones.astype(jnp.float32)
+                target_y = jax.lax.stop_gradient(
+                    team_reward + config["GAMMA"] * not_done * q_next
+                )
 
                 def _loss_fn(params):
                     f_i, f_ij = model.apply(params, batch.obs)
                     q_curr = compute_q_tot(f_i, f_ij, batch.actions, edges_from, edges_to)
-
-                    # Double Q-learning target: action selected via online model
-                    next_f_i, next_f_ij = model.apply(params, batch.next_obs)
-                    greedy_next_act, _ = message_passing(
-                        next_f_i, next_f_ij, edges_from, edges_to, batch.next_avail,
-                        num_agents, action_dim, iterations=config["MSG_ITERATIONS"]
-                    )
-
-                    # Q-value computed on target network
-                    target_f_i, target_f_ij = model.apply(train_state.target_params, batch.next_obs)
-                    q_target = compute_q_tot(target_f_i, target_f_ij, greedy_next_act, edges_from, edges_to)
-
-                    global_reward = jnp.mean(batch.rewards, axis=-1)
-                    target_y = global_reward + config["GAMMA"] * (1.0 - batch.dones) * q_target
-                    td_loss = jnp.mean(jnp.square(q_curr - jax.lax.stop_gradient(target_y)))
-                    return td_loss
+                    return jnp.mean(jnp.square(q_curr - target_y))
 
                 loss, grads = jax.value_and_grad(_loss_fn)(train_state.params)
                 train_state = train_state.apply_gradients(grads=grads)
                 return (train_state, buffer_state, rng), loss
 
             (train_state, buffer_state, rng), losses = jax.lax.scan(
-                _epoch_step,
-                (train_state, buffer_state, rng),
-                None,
-                config["NUM_EPOCHS"],
+                _epoch_step, (train_state, buffer_state, rng), None, config["NUM_EPOCHS"]
             )
 
-            # Periodic Target Update
             new_target = jax.tree.map(
                 lambda p, tp: jnp.where((update_idx % config["TARGET_UPDATE_INTERVAL"]) == 0, p, tp),
                 train_state.params,
                 train_state.target_params,
             )
             train_state = train_state.replace(
-                target_params=new_target,
-                n_updates=train_state.n_updates + 1,
+                target_params=new_target, n_updates=train_state.n_updates + 1
             )
 
-            metrics = {
-                "loss": jnp.mean(losses),
-                "won_rate": jnp.mean(infos["returned_won_episode"]),
-                "returns": jnp.mean(infos["returned_episode_returns"]),
-            }
+            metrics = finished_episode_stats(infos, num_agents)
+            metrics["loss"] = jnp.mean(losses)
+            metrics["epsilon"] = eps
+
+            if config.get("LOG_IN_LOOP", True):
+                jax.debug.callback(_log_update, metrics, update_idx + 1)
 
             runner_state = (train_state, buffer_state, env_state, last_obs, last_done, rng)
             return runner_state, metrics
@@ -384,7 +416,41 @@ def make_train(config: dict):
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state, "metrics": metrics}
+
+        # --- Frozen greedy evaluation (epsilon = 0) ---
+        def evaluate(params, rng):
+            n_env = int(config.get("EVAL_ENVS", 128))
+            n_steps = int(config.get("EVAL_STEPS", 400))
+            rng, rng_reset = jax.random.split(rng)
+            obs_dict, env_state = jax.vmap(env.reset)(jax.random.split(rng_reset, n_env))
+            obs = dict_to_agent_array(obs_dict, env.agents)
+
+            def _eval_step(carry, _):
+                env_state, obs, rng = carry
+                rng, rng_step = jax.random.split(rng)
+                avail_dict = jax.vmap(env.get_avail_actions)(env_state.env_state)
+                avail = dict_to_agent_array(avail_dict, env.agents).astype(jnp.float32)
+                actions = _greedy(params, obs, avail)
+                env_act = {agent: actions[:, i] for i, agent in enumerate(env.agents)}
+                step_rngs = jax.random.split(rng_step, n_env)
+                next_obs_dict, env_state, _, _, infos = jax.vmap(env.step)(
+                    step_rngs, env_state, env_act
+                )
+                next_obs = dict_to_agent_array(next_obs_dict, env.agents)
+                return (env_state, next_obs, rng), infos
+
+            _, infos = jax.lax.scan(_eval_step, (env_state, obs, rng), None, n_steps)
+            return finished_episode_stats(infos, num_agents)
+
+        rng_eval = jax.random.split(runner_state[-1])[0]
+        eval_metrics = evaluate(runner_state[0].params, rng_eval)
+
+        # Do not return the replay buffer (large, and one copy per seed under vmap).
+        return {
+            "metrics": metrics,
+            "eval": eval_metrics,
+            "params": runner_state[0].params,
+        }
 
     return train
 
@@ -402,9 +468,10 @@ def main(config):
     )
 
     rng = jax.random.PRNGKey(config.get("SEED", 42))
-    train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
-    print("DCG training on SMAX 3s5z completed successfully!")
+    out = jax.jit(make_train(config))(rng)
+    ev = {k: float(v) for k, v in out["eval"].items()}
+    print(f"DCG on {config['MAP_NAME']} | greedy eval: {ev}")
+    wandb.finish()
 
 
 if __name__ == "__main__":

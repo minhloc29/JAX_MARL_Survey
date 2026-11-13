@@ -597,12 +597,20 @@ def make_train(config):
                     {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returned_episode_returns"][:, :, 0][
+                        "returned_episode_returns": metric[
+                            "returned_episode_returns"
+                        ][:, :, 0][
                             metric["returned_episode"][:, :, 0]
                         ].mean(),
-                        "win_rate": metric["returned_won_episode"][:, :, 0][
+                        "returned_won_episode": metric["returned_won_episode"][
+                            :, :, 0
+                        ][
                             metric["returned_episode"][:, :, 0]
                         ].mean(),
+                        "returned_episode": metric["returned_episode"][:, :, 0].mean(),
+                        "returned_episode_lengths": metric[
+                            "returned_episode_lengths"
+                        ][:, :, 0][metric["returned_episode"][:, :, 0]].mean(),
                         "env_step": metric["update_steps"]
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
