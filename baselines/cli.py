@@ -9,9 +9,9 @@ import sys
 from pathlib import Path
 
 try:
-    from .registry import ALGO_REGISTRY, FACMAC_REGISTRY
+    from .registry import ALGO_REGISTRY
 except ImportError:
-    from registry import ALGO_REGISTRY, FACMAC_REGISTRY
+    from registry import ALGO_REGISTRY
 
 
 def _load_launcher():
@@ -45,21 +45,6 @@ def _registry_run(registry: dict, algorithm: str, suite: str, env: str) -> dict:
             alg_key=alg_key,
             alg_prefix=alg_prefix,
         )
-    return run
-
-
-def _facmac_run(algorithm: str, suite: str, env: str) -> dict:
-    target = FACMAC_REGISTRY.get((algorithm, suite))
-    run = {
-        "name": f"{algorithm}_{env}",
-        "suite": suite,
-        "env": env,
-        "algo": algorithm,
-        "implemented": target is not None,
-    }
-    if target is not None:
-        config, env_config, env_arg = target
-        run.update(config=config, env_config=env_config, env_arg=env_arg)
     return run
 
 
@@ -117,13 +102,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Save every N training updates (default: 1).",
-    )
-    parser.add_argument(
-        "--override",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Pass an additional native FACMAC Sacred override (repeatable).",
     )
     parser.add_argument(
         "--no-version-tag",
@@ -192,25 +170,6 @@ def _validate_run(run: dict) -> bool:
     return True
 
 
-def _validate_facmac_run(run: dict) -> bool:
-    if not run["implemented"]:
-        print(
-            f"ERROR: no FACMAC entry for ({run['algo']}, {run['suite']})",
-            file=sys.stderr,
-        )
-        return False
-    root = Path(__file__).resolve().parent.parent / "facmac" / "src"
-    for relative in (
-        Path("main.py"),
-        Path("config") / "algs" / f"{run['config']}.yaml",
-        Path("config") / "envs" / f"{run['env_config']}.yaml",
-    ):
-        if not (root / relative).exists():
-            print(f"ERROR: FACMAC file missing: {root / relative}", file=sys.stderr)
-            return False
-    return True
-
-
 def _jax_suite_env_args(suite: str, env: str, alg_prefix: str) -> list[str]:
     if suite == "smax":
         return [f"{alg_prefix}MAP_NAME={env}"]
@@ -224,32 +183,6 @@ def _jax_suite_env_args(suite: str, env: str, alg_prefix: str) -> list[str]:
         }
         return [f"{alg_prefix}ENV_NAME={mpe_names.get(env, env)}"]
     return [f"{alg_prefix}ENV_NAME={env}"]
-
-
-def _run_facmac(
-    run: dict,
-    *,
-    seed: int,
-    gpu: int,
-    steps: int | None,
-    overrides: list[str],
-) -> bool:
-    root = Path(__file__).resolve().parent.parent / "facmac" / "src"
-    command = [
-        sys.executable,
-        "main.py",
-        f"--config={run['config']}",
-        f"--env-config={run['env_config']}",
-        "with",
-        f"seed={seed}",
-        f"env_args.{run['env_arg']}={run['env']}",
-        *overrides,
-    ]
-    if steps is not None:
-        command.append(f"t_max={steps}")
-    environment = os.environ.copy()
-    environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    return subprocess.run(command, cwd=root, env=environment).returncode == 0
 
 
 def _run_jax_facmac(
@@ -306,9 +239,8 @@ def _run_jax_facmac(
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.list_targets:
-        for algorithm, suite in sorted((*ALGO_REGISTRY, *FACMAC_REGISTRY)):
-            family = "facmac" if (algorithm, suite) in FACMAC_REGISTRY else "jaxmarl"
-            print(f"{algorithm:<18} {suite:<12} {family}")
+        for algorithm, suite in sorted(ALGO_REGISTRY):
+            print(f"{algorithm:<18} {suite:<12}")
         return 0
     if args.algorithm == "all":
         algorithms = sorted(
@@ -364,23 +296,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if passed else 1
 
     run = _registry_run(ALGO_REGISTRY, args.algorithm, args.suite, args.env)
-    facmac_run = _facmac_run(args.algorithm, args.suite, args.env)
-    if facmac_run["implemented"]:
-        if not _validate_facmac_run(facmac_run):
-            return 1
-        if args.dry_run:
-            return 0
-        passed = all(
-            _run_facmac(
-                facmac_run,
-                seed=args.seed + index,
-                gpu=args.gpus[index % len(args.gpus)],
-                steps=args.steps,
-                overrides=args.override,
-            )
-            for index in range(args.seeds)
-        )
-        return 0 if passed else 1
     if not _validate_run(run):
         return 1
     if args.dry_run:

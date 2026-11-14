@@ -26,6 +26,7 @@ DictConfig = dict
 from jaxmarl import make
 from jaxmarl.environments.smax import map_name_to_scenario
 from jaxmarl.environments import spaces
+from baselines.metrics import greedy_eval_rollout_multiseed, test_means_stds
 
 
 class FACMACActor(nn.Module):
@@ -114,6 +115,19 @@ def make_train(config: DictConfig | dict[str, Any]):
     action_spaces = [env.action_space(a) for a in agents]
     continuous = isinstance(action_spaces[0], spaces.Box)
     action_dim = max((s.shape[-1] if continuous else s.n) for s in action_spaces)
+
+    # Multi-seed greedy evaluation, matching the other SMAX baselines. Only the
+    # discrete SMAX env supports a dedicated greedy eval (avail-actions + finished-
+    # episode win-rate); continuous (MABRAX/mujoco) stays training-only.
+    env_name_lower = str(env_name).lower()
+    eval_env = None
+    if env_name_lower == "smax":
+        from jaxmarl.wrappers.baselines import SMAXLogWrapper
+
+        eval_env = SMAXLogWrapper(make("SMAX", **env_kwargs))
+
+        def _dict_to_agent_array(d, agent_list):
+            return jnp.stack([d[a] for a in agent_list], axis=1)
     actor, critic = FACMACActor(action_dim, continuous), FACMACCritic()
 
     def train(rng):
@@ -153,6 +167,32 @@ def make_train(config: DictConfig | dict[str, Any]):
             if continuous:
                 return jnp.tanh(output), output
             return jax.random.categorical(key, output, axis=-1), output
+
+        def _run_eval_multiseed(rng):
+            """Greedy (epsilon=0) multi-seed eval on a dedicated SMAX wrapper env.
+            Returns ``{stat: (n_test_seeds,) array}`` for finished-episode stats.
+            """
+            if env_name_lower != "smax":
+                return None
+
+            def greedy_fn(obs, avail):
+                # obs/avail: (n_env, n_agents, dim); logits per agent; mask invalid
+                # with -inf, then argmax -> (n_env, n_agents).
+                logits = actor.apply(actor_state.params, obs)  # (n_env, n_agents, action_dim)
+                logits = logits - (1.0 - avail) * 1e10
+                return jnp.argmax(logits, axis=-1)
+
+            return greedy_eval_rollout_multiseed(
+                env=eval_env,
+                agents=agents,
+                num_agents=len(agents),
+                rng=rng,
+                n_test_seeds=int(cfg.get("TEST_NUM_SEEDS", 5)),
+                n_env=int(cfg.get("TEST_NUM_ENVS", 128)),
+                n_steps=int(cfg.get("TEST_NUM_STEPS", 128)),
+                greedy_fn=greedy_fn,
+                dict_to_agent_array=_dict_to_agent_array,
+            )
 
         def step(carry, _):
             actor_state, critic_state, env_state, obs, rng = carry
@@ -275,6 +315,14 @@ def make_train(config: DictConfig | dict[str, Any]):
                 "update": update + 1,
                 "time/update_seconds": time.monotonic() - update_start,
             }
+            # Periodic multi-seed greedy evaluation, matching the other baselines.
+            if eval_env is not None and int(cfg.get("TEST_DURING_TRAINING", True)):
+                eval_interval = max(
+                    1, int(float(cfg.get("TEST_INTERVAL", 0.05)) * updates)
+                )
+                if (update + 1) % eval_interval == 0:
+                    rng, eval_key = jax.random.split(rng)
+                    metrics.update(test_means_stds(_run_eval_multiseed(eval_key)))
             wandb.log(
                 metrics,
                 step=timesteps,
@@ -349,6 +397,11 @@ def main() -> None:
         "WANDB_MODE": "disabled",
         "CHECKPOINT_PATH": "",
         "CHECKPOINT_INTERVAL": 1,
+        "TEST_DURING_TRAINING": True,
+        "TEST_INTERVAL": 0.05,
+        "TEST_NUM_STEPS": 128,
+        "TEST_NUM_ENVS": 512,
+        "TEST_NUM_SEEDS": 5,
     }
     for argument in sys.argv[1:]:
         if "=" not in argument:

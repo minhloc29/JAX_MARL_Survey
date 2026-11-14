@@ -2,3 +2,10 @@ ENV_NAME: SMAX
 MAP_NAME: 3s5z
 NUM_STEPS: 128
 NUM_ENVS: 16
+
+# Periodic greedy evaluation (epsilon = 0) during training
+TEST_DURING_TRAINING: True
+TEST_INTERVAL: 0.05   # fraction of updates; eval every TEST_INTERVAL * NUM_UPDATES
+TEST_NUM_STEPS: 128
+TEST_NUM_ENVS: 512    # parallel eval environments
+TEST_NUM_SEEDS: 5     # independent test seeds; mean/std logged to WandB
