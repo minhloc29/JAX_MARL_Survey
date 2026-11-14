@@ -24,7 +24,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from baselines.metrics import log_metrics
+from baselines.metrics import finished_episode_stats, greedy_eval_rollout, log_metrics
 from jaxmarl import make
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -224,6 +224,37 @@ class MATModel(nn.Module):
         output_log_probs = jnp.stack(log_probs_list, axis=1)
         return output_actions, output_log_probs, v_loc
 
+    def get_greedy_actions(
+        self, obs: jax.Array, avail_actions: jax.Array
+    ) -> jax.Array:
+        """Deterministic (argmax) autoregressive action generation for evaluation.
+
+        Identical to :meth:`get_actions` but picks the greedy action instead of
+        sampling, so the same policy can be evaluated at ``epsilon = 0``.
+        """
+        batch_size = obs.shape[0]
+        _, rep = self.encoder(obs)
+
+        shifted = jnp.zeros((batch_size, self.n_agents, self.action_dim + 1), dtype=jnp.float32)
+        shifted = shifted.at[:, 0, 0].set(1.0)
+
+        actions_list = []
+        for i in range(self.n_agents):
+            logits = self.decoder(shifted, rep)
+            logit_i = logits[:, i, :]
+            mask_i = avail_actions[:, i, :]
+            logit_i = logit_i - (1.0 - mask_i) * 1e10
+
+            action_i = jnp.argmax(logit_i, axis=-1)
+            actions_list.append(action_i)
+
+            if i + 1 < self.n_agents:
+                one_hot_i = jax.nn.one_hot(action_i, self.action_dim)
+                shifted = shifted.at[:, i + 1, 1:].set(one_hot_i)
+
+        return jnp.stack(actions_list, axis=1)
+
+
 
 # =============================================================================
 # Rollout & Training Structures
@@ -314,7 +345,7 @@ def make_train(config: dict):
 
         # 3. Main Update Loop
         def _update_step(runner_state, update_index):
-            train_state, env_state, last_obs, last_done, rng = runner_state
+            train_state, env_state, last_obs, last_done, rng, test_state = runner_state
 
             # --- ROLLOUT ---
             def _env_step(carry, _):
@@ -469,6 +500,40 @@ def make_train(config: dict):
             train_state = update_state[0]
             rng = update_state[-1]
 
+            # Periodic greedy evaluation (epsilon = 0) during training, matching the
+            # RODE baseline: run a frozen greedy rollout every EVAL_INTERVAL updates
+            # and report finished-episode stats under a test_ prefix.
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * config["NUM_UPDATES"])
+            )
+
+            def _run_eval(rng):
+                def greedy_fn(obs, avail):
+                    return model.apply(
+                        params=train_state.params,
+                        obs=obs,
+                        avail_actions=avail,
+                        method=model.get_greedy_actions,
+                    )
+
+                return greedy_eval_rollout(
+                    env=env,
+                    agents=env.agents,
+                    num_agents=num_agents,
+                    rng=rng,
+                    n_env=int(config.get("TEST_NUM_ENVS", 128)),
+                    n_steps=int(config.get("TEST_NUM_STEPS", 128)),
+                    greedy_fn=greedy_fn,
+                    dict_to_agent_array=dict_to_agent_array,
+                )
+
+            rng, rng_eval = jax.random.split(rng)
+            new_test_state = jax.lax.cond(
+                (update_index + 1) % eval_interval == 0,
+                lambda: _run_eval(rng_eval),
+                lambda: test_state,
+            )
+
             # Metrics callback for WandB
             metrics = {
                 "loss": jnp.mean(loss_metrics[0]),
@@ -483,13 +548,27 @@ def make_train(config: dict):
                 ),
                 "returned_episode": jnp.mean(traj_batch.info["returned_episode"]),
             }
+            metrics.update({"test_" + k: v for k, v in new_test_state.items()})
             jax.debug.callback(_log_update, metrics, update_index + 1)
 
-            runner_state = (train_state, env_state, last_obs, last_done, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, rng, new_test_state)
             return runner_state, metrics
 
         # 4. Run All Updates via lax.scan
-        runner_state = (train_state, env_state, last_obs, last_done, rng)
+        test_template = {
+            "returned_won_episode": jnp.asarray(0.0),
+            "returned_episode_returns": jnp.asarray(0.0),
+            "returned_episode_lengths": jnp.asarray(0.0),
+            "returned_episode": jnp.asarray(0.0),
+        }
+        runner_state = (
+            train_state,
+            env_state,
+            last_obs,
+            last_done,
+            rng,
+            test_template,
+        )
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )

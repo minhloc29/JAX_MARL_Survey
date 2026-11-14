@@ -24,7 +24,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from baselines.metrics import log_metrics
+from baselines.metrics import greedy_eval_rollout, log_metrics
 from jaxmarl import make
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -166,6 +166,15 @@ class DICGModel(nn.Module):
         critic_emb, _ = self.critic_base(obs)
         return self.critic_head(critic_emb).squeeze(-1)
 
+    def get_greedy_actions(
+        self, obs: jax.Array, avail_actions: jax.Array
+    ) -> jax.Array:
+        """Deterministic (argmax) action selection for epsilon=0 evaluation."""
+        actor_emb, _ = self.actor_base(obs)
+        logits = self.actor_head(actor_emb)
+        logits = logits - (1.0 - avail_actions) * 1e10
+        return jnp.argmax(logits, axis=-1)
+
 
 # =============================================================================
 # Rollout & Training Structures
@@ -257,7 +266,7 @@ def make_train(config: dict):
             )
 
         def _update_step(runner_state, update_index):
-            train_state, env_state, last_obs, last_done, rng = runner_state
+            train_state, env_state, last_obs, last_done, rng, test_state = runner_state
 
             # --- ROLLOUT ---
             def _env_step(carry, _):
@@ -406,6 +415,38 @@ def make_train(config: dict):
             train_state = update_state[0]
             rng = update_state[-1]
 
+            # Periodic greedy evaluation (epsilon = 0) during training, matching RODE.
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * config["NUM_UPDATES"])
+            )
+
+            def _run_eval(rng):
+                def greedy_fn(obs, avail):
+                    return model.apply(
+                        params=train_state.params,
+                        obs=obs,
+                        avail_actions=avail,
+                        method=model.get_greedy_actions,
+                    )
+
+                return greedy_eval_rollout(
+                    env=env,
+                    agents=env.agents,
+                    num_agents=num_agents,
+                    rng=rng,
+                    n_env=int(config.get("TEST_NUM_ENVS", 128)),
+                    n_steps=int(config.get("TEST_NUM_STEPS", 128)),
+                    greedy_fn=greedy_fn,
+                    dict_to_agent_array=dict_to_agent_array,
+                )
+
+            rng, rng_eval = jax.random.split(rng)
+            new_test_state = jax.lax.cond(
+                (update_index + 1) % eval_interval == 0,
+                lambda: _run_eval(rng_eval),
+                lambda: test_state,
+            )
+
             metrics = {
                 "loss": jnp.mean(loss_metrics[0]),
                 "returned_won_episode": jnp.mean(
@@ -419,12 +460,26 @@ def make_train(config: dict):
                 ),
                 "returned_episode": jnp.mean(traj_batch.info["returned_episode"]),
             }
+            metrics.update({"test_" + k: v for k, v in new_test_state.items()})
             jax.debug.callback(_log_update, metrics, update_index + 1)
 
-            runner_state = (train_state, env_state, last_obs, last_done, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, rng, new_test_state)
             return runner_state, metrics
 
-        runner_state = (train_state, env_state, last_obs, last_done, rng)
+        test_template = {
+            "returned_won_episode": jnp.asarray(0.0),
+            "returned_episode_returns": jnp.asarray(0.0),
+            "returned_episode_lengths": jnp.asarray(0.0),
+            "returned_episode": jnp.asarray(0.0),
+        }
+        runner_state = (
+            train_state,
+            env_state,
+            last_obs,
+            last_done,
+            rng,
+            test_template,
+        )
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )

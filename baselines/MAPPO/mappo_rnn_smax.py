@@ -19,7 +19,10 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from baselines.metrics import log_metrics
+from baselines.metrics import (
+    greedy_eval_rollout_stateful,
+    log_metrics,
+)
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import JaxMARLWrapper, SMAXLogWrapper
 
@@ -294,7 +297,7 @@ def make_train(config):
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
-            runner_state, update_steps = update_runner_state
+            runner_state, update_steps, test_state = update_runner_state
 
             def _env_step(runner_state, unused):
                 train_states, env_state, last_obs, last_done, hstates, rng = (
@@ -593,9 +596,51 @@ def make_train(config):
             metric["loss"] = loss_info
             rng = update_state[-1]
 
-            def callback(metric):
+            def _run_eval(rng):
+                n_env = int(config.get("TEST_NUM_ENVS", 128))
+                n_steps = int(config.get("TEST_NUM_STEPS", 128))
+                n_actors = n_env * env.num_agents
+                init_h = ScannedRNN.initialize_carry(n_actors, config["GRU_HIDDEN_DIM"])
+
+                def greedy_step(hstate, obs, avail, done):
+                    obs_batch = obs.reshape((n_actors, -1))
+                    avail_batch = avail.reshape((n_actors, -1))
+                    done_batch = jnp.repeat(done, env.num_agents)
+                    ac_in = (
+                        obs_batch[np.newaxis, :],
+                        done_batch[np.newaxis, :],
+                        avail_batch,
+                    )
+                    hstate, pi = actor_network.apply(train_states[0].params, hstate, ac_in)
+                    action = pi.mode().squeeze(0).reshape((n_env, env.num_agents))
+                    return hstate, action
+
+                return greedy_eval_rollout_stateful(
+                    env=env,
+                    agents=env.agents,
+                    num_agents=env.num_agents,
+                    rng=rng,
+                    n_env=n_env,
+                    n_steps=n_steps,
+                    init_state=init_h,
+                    greedy_step=greedy_step,
+                    dict_to_agent_array=lambda d, a: jnp.stack([d[ag] for ag in a], axis=1),
+                )
+
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * config["NUM_UPDATES"])
+            )
+            rng, rng_eval = jax.random.split(rng)
+            new_test_state = jax.lax.cond(
+                (update_steps + 1) % eval_interval == 0,
+                lambda: _run_eval(rng_eval),
+                lambda: test_state,
+            )
+
+            def callback(metric, test_state):
                 log_metrics(
-                    {
+                    {"test_" + k: v for k, v in test_state.items()}
+                    | {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returned_episode_returns": metric[
@@ -628,11 +673,17 @@ def make_train(config):
                 )
 
             metric["update_steps"] = update_steps
-            jax.experimental.io_callback(callback, None, metric)
+            jax.experimental.io_callback(callback, None, metric, new_test_state)
             update_steps = update_steps + 1
             runner_state = (train_states, env_state, last_obs, last_done, hstates, rng)
-            return (runner_state, update_steps), metric
+            return (runner_state, update_steps, new_test_state), metric
 
+        test_template = {
+            "returned_won_episode": jnp.asarray(0.0),
+            "returned_episode_returns": jnp.asarray(0.0),
+            "returned_episode_lengths": jnp.asarray(0.0),
+            "returned_episode": jnp.asarray(0.0),
+        }
         rng, _rng = jax.random.split(rng)
         runner_state = (
             (actor_train_state, critic_train_state),
@@ -643,9 +694,9 @@ def make_train(config):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
+            _update_step, (runner_state, 0, test_template), None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state}
+        return {"runner_state": runner_state, "metrics": metric}
 
     return train
 

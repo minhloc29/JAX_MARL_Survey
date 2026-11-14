@@ -24,6 +24,12 @@
   "attack_mode": "closest"
 "ANNEAL_LR": True
 
+# Periodic greedy evaluation (epsilon = 0) during training
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05
+"TEST_NUM_STEPS": 128
+"TEST_NUM_ENVS": 512
+
 # WandB Params
 "ENTITY": ${oc.env:WANDB_ENTITY}
 "PROJECT": "jaxmarl-smax"
