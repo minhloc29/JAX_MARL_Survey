@@ -42,7 +42,12 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from baselines.metrics import log_metrics
+from baselines.metrics import (
+    finished_episode_stats,
+    greedy_eval_rollout,
+    greedy_eval_rollout_multiseed,
+    log_metrics,
+)
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
 
@@ -211,23 +216,6 @@ class Transition:
     next_avail: jax.Array
 
 
-def finished_episode_stats(infos, num_agents: int):
-    """Average episode statistics over FINISHED episodes only.
-
-    infos leaves have shape (steps, envs, agents). The wrapper repeats the last
-    finished episode's value on every step, so each value is weighted by the
-    'returned_episode' flag (1 only on the step where an episode just ended).
-    """
-    done_ep = infos["returned_episode"].astype(jnp.float32)
-    n = jnp.maximum(done_ep.sum(), 1.0)
-    return {
-        "won_rate": (infos["returned_won_episode"] * done_ep).sum() / n,
-        "returns": (infos["returned_episode_returns"] * done_ep).sum() / n,
-        "episode_length": (infos["returned_episode_lengths"] * done_ep).sum() / n,
-        "n_episodes": done_ep.sum() / num_agents,
-    }
-
-
 def make_train(config: dict):
     scenario = map_name_to_scenario(config["MAP_NAME"])
     env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
@@ -311,7 +299,7 @@ def make_train(config: dict):
             return actions
 
         def _update_step(runner_state, update_idx):
-            train_state, buffer_state, env_state, last_obs, last_done, rng = runner_state
+            train_state, buffer_state, env_state, last_obs, last_done, rng, test_state = runner_state
             eps = eps_scheduler(train_state.n_updates)
 
             # --- COLLECT ROLLOUT (epsilon-greedy) ---
@@ -406,51 +394,76 @@ def make_train(config: dict):
             metrics["loss"] = jnp.mean(losses)
             metrics["epsilon"] = eps
 
+            # Periodic greedy evaluation (epsilon = 0) during training, matching RODE.
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * config["NUM_UPDATES"])
+            )
+
+            def _run_eval(rng):
+                def greedy_fn(obs, avail):
+                    return _greedy(train_state.params, obs, avail)
+
+                return greedy_eval_rollout_multiseed(
+                    env=env,
+                    agents=env.agents,
+                    num_agents=num_agents,
+                    rng=rng,
+                    n_test_seeds=int(config.get("TEST_NUM_SEEDS", 5)),
+                    n_env=int(config.get("TEST_NUM_ENVS", 128)),
+                    n_steps=int(config.get("TEST_NUM_STEPS", 128)),
+                    greedy_fn=greedy_fn,
+                    dict_to_agent_array=dict_to_agent_array,
+                )
+
+            rng, rng_eval = jax.random.split(rng)
+            new_test_state = jax.lax.cond(
+                (update_idx + 1) % eval_interval == 0,
+                lambda: _run_eval(rng_eval),
+                lambda: test_state,
+            )
+            # Log per-test-seed mean and std so WandB shows both the value and
+            # the run-to-run variance, plus individual seed traces.
+            for k in test_template:
+                arr = new_test_state[k]
+                metrics[f"test_{k}/mean"] = jnp.mean(arr)
+                metrics[f"test_{k}/std"] = jnp.std(arr)
+
             if config.get("LOG_IN_LOOP", True):
                 jax.debug.callback(_log_update, metrics, update_idx + 1)
 
-            runner_state = (train_state, buffer_state, env_state, last_obs, last_done, rng)
+            runner_state = (
+                train_state,
+                buffer_state,
+                env_state,
+                last_obs,
+                last_done,
+                rng,
+                new_test_state,
+            )
             return runner_state, metrics
 
-        runner_state = (train_state, buffer_state, env_state, last_obs, last_done, rng)
+        n_test_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+        test_template = {
+            "returned_won_episode": jnp.zeros((n_test_seeds,)),
+            "returned_episode_returns": jnp.zeros((n_test_seeds,)),
+            "returned_episode_lengths": jnp.zeros((n_test_seeds,)),
+            "returned_episode": jnp.zeros((n_test_seeds,)),
+        }
+        runner_state = (
+            train_state,
+            buffer_state,
+            env_state,
+            last_obs,
+            last_done,
+            rng,
+            test_template,
+        )
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
 
-        # --- Frozen greedy evaluation (epsilon = 0) ---
-        def evaluate(params, rng):
-            n_env = int(config.get("EVAL_ENVS", 128))
-            n_steps = int(config.get("EVAL_STEPS", 400))
-            rng, rng_reset = jax.random.split(rng)
-            obs_dict, env_state = jax.vmap(env.reset)(jax.random.split(rng_reset, n_env))
-            obs = dict_to_agent_array(obs_dict, env.agents)
-
-            def _eval_step(carry, _):
-                env_state, obs, rng = carry
-                rng, rng_step = jax.random.split(rng)
-                avail_dict = jax.vmap(env.get_avail_actions)(env_state.env_state)
-                avail = dict_to_agent_array(avail_dict, env.agents).astype(jnp.float32)
-                actions = _greedy(params, obs, avail)
-                env_act = {agent: actions[:, i] for i, agent in enumerate(env.agents)}
-                step_rngs = jax.random.split(rng_step, n_env)
-                next_obs_dict, env_state, _, _, infos = jax.vmap(env.step)(
-                    step_rngs, env_state, env_act
-                )
-                next_obs = dict_to_agent_array(next_obs_dict, env.agents)
-                return (env_state, next_obs, rng), infos
-
-            _, infos = jax.lax.scan(_eval_step, (env_state, obs, rng), None, n_steps)
-            return finished_episode_stats(infos, num_agents)
-
-        rng_eval = jax.random.split(runner_state[-1])[0]
-        eval_metrics = evaluate(runner_state[0].params, rng_eval)
-
         # Do not return the replay buffer (large, and one copy per seed under vmap).
-        return {
-            "metrics": metrics,
-            "eval": eval_metrics,
-            "params": runner_state[0].params,
-        }
+        return {"metrics": metrics, "params": runner_state[0].params}
 
     return train
 
@@ -469,8 +482,14 @@ def main(config):
 
     rng = jax.random.PRNGKey(config.get("SEED", 42))
     out = jax.jit(make_train(config))(rng)
-    ev = {k: float(v) for k, v in out["eval"].items()}
-    print(f"DCG on {config['MAP_NAME']} | greedy eval: {ev}")
+    final = out["metrics"]
+    print(
+        f"DCG on {config['MAP_NAME']} | "
+        f"test win rate: {float(final['test_returned_won_episode/mean'][-1]):.3f} ± "
+        f"{float(final['test_returned_won_episode/std'][-1]):.3f} | "
+        f"test return: {float(final['test_returned_episode_returns/mean'][-1]):.3f} ± "
+        f"{float(final['test_returned_episode_returns/std'][-1]):.3f}"
+    )
     wandb.finish()
 
 

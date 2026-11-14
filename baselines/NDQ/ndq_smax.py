@@ -26,10 +26,18 @@ from jaxmarl.environments.smax import map_name_to_scenario
 from jaxmarl.wrappers.baselines import CTRolloutManager, SMAXLogWrapper
 
 try:
-    from baselines.metrics import log_metrics
+    from baselines.metrics import (
+        finished_episode_stats,
+        log_metrics,
+        test_means_stds,
+    )
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from baselines.metrics import log_metrics
+    from baselines.metrics import (
+        finished_episode_stats,
+        log_metrics,
+        test_means_stds,
+    )
 
 
 class AgentQNetwork(nn.Module):
@@ -161,7 +169,7 @@ def make_train(config: dict[str, Any]):
             next_hidden, q_values, mu, sigma, messages = forward_batch(
                 state.params, hidden, _stack(obs, agents), comm_keys, True
             )
-            valid_dict = wrapped_env.get_valid_actions(env_state)
+            valid_dict = wrapped_env.get_valid_actions(env_state.env_state)
             valid = jnp.stack([valid_dict[agent] for agent in agents], axis=1)
             epsilon = epsilon_schedule(rollout_index * rollout_steps)
             greedy = jnp.argmax(jnp.where(valid, q_values, -1e10), axis=-1)
@@ -187,7 +195,7 @@ def make_train(config: dict[str, Any]):
             next_obs, next_state, rewards, dones, infos = wrapped_env.batch_step(
                 step_key, env_state, action_dict
             )
-            next_valid_dict = wrapped_env.get_valid_actions(next_state)
+            next_valid_dict = wrapped_env.get_valid_actions(next_state.env_state)
             next_valid = jnp.stack(
                 [next_valid_dict[agent] for agent in agents], axis=1
             )
@@ -281,6 +289,48 @@ def make_train(config: dict[str, Any]):
             network_params = optax.apply_updates(network_params, updates)
             return network_params, opt_state, (loss, aux)
 
+        def _run_eval(key):
+            """Frozen (epsilon=0) greedy evaluation, matching the dict-family baselines.
+
+            Uses the same CTRolloutManager interface as training but with a dedicated
+            batch of ``TEST_NUM_ENVS`` environments and deterministic (argmax, no
+            communication noise) action selection. Returns finished-episode stats.
+            """
+            n_env = int(config.get("TEST_NUM_ENVS", 128))
+            n_steps = int(config.get("TEST_NUM_STEPS", 128))
+            eval_env = CTRolloutManager(env, batch_size=n_env)
+            obs, eval_env_state = eval_env.batch_reset(key)
+            hidden = jnp.zeros((n_env, num_agents, hidden_dim))
+
+            def _eval_step(carry, _):
+                obs, env_st, hidden, rng = carry
+                rng, comm_key, step_key = jax.random.split(rng, 3)
+                comm_keys = jax.random.split(comm_key, n_env)
+                _, q_values, _, _, _ = forward_batch(
+                    state.params, hidden, _stack(obs, agents), comm_keys, False
+                )
+                valid_dict = eval_env.get_valid_actions(env_st.env_state)
+                valid = jnp.stack([valid_dict[agent] for agent in agents], axis=1)
+                greedy = jnp.argmax(jnp.where(valid, q_values, -1e10), axis=-1)
+                action_dict = {agent: greedy[:, i] for i, agent in enumerate(agents)}
+                next_obs, next_state, _, dones, infos = eval_env.batch_step(
+                    step_key, env_st, action_dict
+                )
+                done = dones["__all__"].astype(jnp.bool_)
+                next_hidden = jnp.where(
+                    done[:, None, None], jnp.zeros_like(hidden), hidden
+                )
+                return (next_obs, next_state, next_hidden, rng), infos
+
+            _, infos = jax.lax.scan(
+                _eval_step,
+                (obs, eval_env_state, hidden, jax.random.split(key, 1)[0]),
+                None,
+                n_steps,
+            )
+            stats = finished_episode_stats(infos, num_agents)
+            return {k: v for k, v in stats.items()}
+
         metrics_history = []
         start_time = time.time()
         obs, env_state = wrapped_env.batch_reset(rng)
@@ -303,13 +353,23 @@ def make_train(config: dict[str, Any]):
             td, q_taken, target, kl, entropy, comm_rate = aux
             timesteps = min((update + 1) * rollout_steps * num_envs, total_steps)
 
-            win_rate = (
-                float(won[completed].mean())
-                if completed.any()
-                else float("nan")
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * num_updates)
             )
-            metrics = {
-                "loss/total": float(loss),
+            test_metrics = {}
+            if int(config.get("TEST_DURING_TRAINING", False)) and (update + 1) % eval_interval == 0:
+                rng, eval_key = jax.random.split(rng)
+                n_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+                seed_keys = list(jax.random.split(eval_key, n_seeds))
+                per_run = [_run_eval(k) for k in seed_keys]
+                # per-stat: (n_seeds,) array from the list of per-seed dicts
+                per_seed = {
+                    key: jnp.stack([d[key] for d in per_run])
+                    for key in per_run[0]
+                }
+                test_metrics = test_means_stds(per_seed)
+
+            metrics = {                "loss/total": float(loss),
                 "loss/td_error_abs": float(jnp.abs(td).mean()),
                 "communication/kl": float(kl),
                 "communication/entropy": float(entropy),
@@ -321,26 +381,27 @@ def make_train(config: dict[str, Any]):
                 "rollout/reward_mean": float(batch[6].mean()),
                 "rollout/reward_std": float(batch[6].std()),
                 "rollout/done_rate": float(batch[7].mean()),
-                "returned_won_episode": float(np.asarray(returned_won_episode)[-1].mean()),
-                "returned_episode": float(np.asarray(returned_episode)[-1].mean()),
+                "returned_won_episode": float(np.asarray(batch[12])[-1].mean()),
+                "returned_episode": float(np.asarray(batch[13])[-1].mean()),
                 "returned_episode_returns": float(
-                    np.asarray(returned_episode_returns)[-1].mean()
+                    np.asarray(batch[14])[-1].mean()
                 ),
                 "returned_episode_lengths": float(
-                    np.asarray(returned_episode_lengths)[-1].mean()
+                    np.asarray(batch[15])[-1].mean()
                 ),
                 "exploration/epsilon": float(epsilon_schedule(update * rollout_steps)),
                 "training/update": update + 1,
                 "training/timesteps": timesteps,
                 "training/updates_per_second": (update + 1) / max(time.time() - start_time, 1e-6),
             }
+            metrics.update(test_metrics)
             log_metrics(metrics, step=timesteps)
             metrics_history.append(metrics)
             print(
                 f"NDQ update {update + 1}/{num_updates} "
                 f"timesteps={timesteps}/{total_steps} "
                 f"reward={metrics['rollout/reward_mean']:.4f} "
-                f"return={metrics['rollout/return']:.4f} "
+                f"return={metrics['returned_episode_returns']:.4f} "
                 f"comm={metrics['communication/rate']:.3f}",
                 flush=True,
             )
@@ -379,6 +440,11 @@ def main() -> None:
         "WANDB_MODE": "disabled",
         "CHECKPOINT_PATH": "",
         "CHECKPOINT_INTERVAL": 1,
+        "TEST_DURING_TRAINING": True,
+        "TEST_INTERVAL": 0.05,
+        "TEST_NUM_STEPS": 128,
+        "TEST_NUM_ENVS": 512,
+        "TEST_NUM_SEEDS": 5,
     }
     for argument in sys.argv[1:]:
         if "=" not in argument:

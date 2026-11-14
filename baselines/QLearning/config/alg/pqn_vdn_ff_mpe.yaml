@@ -27,4 +27,6 @@
 "TEST_NUM_STEPS": 30
 "TEST_NUM_ENVS": 512 # number of episodes to average over, can affect performance
 
+"TEST_NUM_SEEDS": 5 # number of test seeds to average mean/std over
+
 #"ALG_NAME": "pqn_vdn_ff" # if you want to change the name of the algo in the metrics

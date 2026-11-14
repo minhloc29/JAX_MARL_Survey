@@ -20,10 +20,10 @@ from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
 
 try:
-    from baselines.metrics import log_metrics
+    from baselines.metrics import finished_episode_stats, log_metrics
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from baselines.metrics import log_metrics
+    from baselines.metrics import finished_episode_stats, log_metrics
 
 
 class I2CActorCritic(nn.Module):
@@ -263,6 +263,51 @@ def make_train(config: dict[str, Any]):
             metrics,
         )
 
+    @jax.jit
+    def _run_eval(params, rng):
+        """Frozen (epsilon=0, gate forced on) greedy evaluation.
+
+        Deterministic argmax action selection with full communication, matching the
+        dict-family baselines. Returns finished-episode stats over a dedicated batch
+        of ``TEST_NUM_ENVS`` environments.
+        """
+        n_env = int(config.get("TEST_NUM_ENVS", 128))
+        n_steps = int(config.get("TEST_NUM_STEPS", 128))
+        rng, reset_key = jax.random.split(rng)
+        reset_keys = jax.random.split(reset_key, n_env)
+        obs_dict, eval_env_state = jax.vmap(env.reset)(reset_keys)
+        obs = jnp.stack([obs_dict[agent] for agent in agents])  # (n_agents, n_env, obs_dim)
+
+        def _eval_step(carry, _):
+            obs, eval_env_state, rng = carry
+            rng, step_key = jax.random.split(rng)
+            msg = _message(obs)
+            global_obs = obs.transpose(1, 0, 2).reshape(n_env, global_dim)
+            flat_obs = obs.reshape(num_agents * n_env, obs_dim)
+            flat_msg = msg.reshape(num_agents * n_env, obs_dim)
+            avail_dict = jax.vmap(env.get_avail_actions)(eval_env_state.env_state)
+            avail = jnp.stack([avail_dict[agent] for agent in agents])
+            flat_avail = avail.reshape(num_agents * n_env, action_dim)
+            # Greedy: gate forced fully on -> effective message is the raw message.
+            logits, _, _ = network.apply(params, flat_obs, flat_msg, global_obs)
+            logits = logits - (1 - flat_avail) * 1e10
+            action = jnp.argmax(logits, axis=-1)
+            env_actions = {
+                agent: action[index * n_env : (index + 1) * n_env]
+                for index, agent in enumerate(agents)
+            }
+            next_obs_dict, next_env_state, _, done_dict, info = jax.vmap(
+                env.step, in_axes=(0, 0, 0)
+            )(jax.random.split(step_key, n_env), eval_env_state, env_actions)
+            next_obs = jnp.stack([next_obs_dict[agent] for agent in agents])
+            return (next_obs, next_env_state, rng), info
+
+        _, infos = jax.lax.scan(
+            _eval_step, (obs, eval_env_state, rng), None, length=n_steps
+        )
+        # infos leaves are (n_steps, n_env, num_agents)
+        return finished_episode_stats(infos, num_agents)
+
     def train(rng: jax.Array):
         nonlocal state
         rng, reset_key = jax.random.split(rng)
@@ -300,6 +345,15 @@ def make_train(config: dict[str, Any]):
             completed_episodes = int(completed.sum())
             completed_wins = int(won_arr[completed].sum())
             timestep = min((update + 1) * rollout_steps * num_envs, total_steps)
+
+            test_metrics = {}
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * num_updates)
+            )
+            if int(config.get("TEST_DURING_TRAINING", False)) and (update + 1) % eval_interval == 0:
+                rng, eval_key = jax.random.split(rng)
+                test_metrics = _run_eval(state.params, eval_key)
+
             log_metrics(
                 {
                     "returned_episode_returns": float(
@@ -331,6 +385,11 @@ def make_train(config: dict[str, Any]):
                 },
                 step=timestep,
             )
+            if test_metrics:
+                log_metrics(
+                    {"test_" + k: v for k, v in test_metrics.items()},
+                    step=timestep,
+                )
             print(
                 f"I2C SMAX update {update + 1}/{num_updates} "
                 f"reward={rewards_arr.mean():.4f} comm={gates_arr.mean():.3f}",
@@ -368,6 +427,10 @@ def main() -> None:
         "WANDB_MODE": "disabled",
         "CHECKPOINT_PATH": "",
         "CHECKPOINT_INTERVAL": 1,
+        "TEST_DURING_TRAINING": True,
+        "TEST_INTERVAL": 0.05,
+        "TEST_NUM_STEPS": 128,
+        "TEST_NUM_ENVS": 512,
     }
     int_keys = {"SEED", "NUM_ENVS", "NUM_STEPS", "TOTAL_TIMESTEPS", "CHECKPOINT_INTERVAL", "HIDDEN_DIM"}
     float_keys = {"LR", "GAMMA", "ENT_COEF", "VF_COEF", "MAX_GRAD_NORM"}

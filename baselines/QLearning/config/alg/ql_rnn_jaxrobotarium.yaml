@@ -44,4 +44,6 @@
 "TEST_NUM_STEPS": 101
 "TEST_NUM_ENVS": 64 # number of episodes to average over, can affect performance
 
+"TEST_NUM_SEEDS": 5 # number of test seeds to average mean/std over
+
 "LOG_AGENTS_SEPARATELY": True # iql will log indipendent agents separately
