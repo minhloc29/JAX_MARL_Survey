@@ -24,7 +24,12 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from baselines.metrics import finished_episode_stats, greedy_eval_rollout, log_metrics
+from baselines.metrics import (
+    finished_episode_stats,
+    greedy_eval_rollout,
+    greedy_eval_rollout_multiseed,
+    log_metrics,
+)
 from jaxmarl import make
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -516,11 +521,12 @@ def make_train(config: dict):
                         method=model.get_greedy_actions,
                     )
 
-                return greedy_eval_rollout(
+                return greedy_eval_rollout_multiseed(
                     env=env,
                     agents=env.agents,
                     num_agents=num_agents,
                     rng=rng,
+                    n_test_seeds=int(config.get("TEST_NUM_SEEDS", 5)),
                     n_env=int(config.get("TEST_NUM_ENVS", 128)),
                     n_steps=int(config.get("TEST_NUM_STEPS", 128)),
                     greedy_fn=greedy_fn,
@@ -548,18 +554,24 @@ def make_train(config: dict):
                 ),
                 "returned_episode": jnp.mean(traj_batch.info["returned_episode"]),
             }
-            metrics.update({"test_" + k: v for k, v in new_test_state.items()})
+            # Log per-test-seed mean and std so WandB shows both the value and
+            # the run-to-run variance.
+            for k in test_template:
+                arr = new_test_state[k]
+                metrics[f"test_{k}/mean"] = jnp.mean(arr)
+                metrics[f"test_{k}/std"] = jnp.std(arr)
             jax.debug.callback(_log_update, metrics, update_index + 1)
 
             runner_state = (train_state, env_state, last_obs, last_done, rng, new_test_state)
             return runner_state, metrics
 
         # 4. Run All Updates via lax.scan
+        n_test_seeds = int(config.get("TEST_NUM_SEEDS", 5))
         test_template = {
-            "returned_won_episode": jnp.asarray(0.0),
-            "returned_episode_returns": jnp.asarray(0.0),
-            "returned_episode_lengths": jnp.asarray(0.0),
-            "returned_episode": jnp.asarray(0.0),
+            "returned_won_episode": jnp.zeros((n_test_seeds,)),
+            "returned_episode_returns": jnp.zeros((n_test_seeds,)),
+            "returned_episode_lengths": jnp.zeros((n_test_seeds,)),
+            "returned_episode": jnp.zeros((n_test_seeds,)),
         }
         runner_state = (
             train_state,

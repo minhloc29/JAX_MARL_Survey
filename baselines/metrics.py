@@ -92,6 +92,52 @@ def greedy_eval_rollout(
     return finished_episode_stats(infos, num_agents)
 
 
+def greedy_eval_rollout_multiseed(
+    *,
+    env,
+    agents: list[str],
+    num_agents: int,
+    rng: jax.Array,
+    n_test_seeds: int,
+    n_env: int,
+    n_steps: int,
+    greedy_fn,
+    dict_to_agent_array,
+) -> dict:
+    """Run ``n_test_seeds`` independent (frozen, epsilon=0) greedy evals.
+
+    A single :func:`greedy_eval_rollout` folds ``n_env`` parallel environments
+    into one episode-weighted metric; that averages out the *environment* noise
+    but gives no sense of run-to-run (seed) variance. This helper runs
+    ``n_test_seeds`` separate greedy rollouts, each with its own split PRNG key,
+    and returns one per-seed entry per finished-episode stat.
+
+    Returns:
+        dict mapping each stat key (``returned_won_episode``,
+        ``returned_episode_returns``, ``returned_episode_lengths``,
+        ``returned_episode``) to an array of shape ``(n_test_seeds,)``. Reduce with
+        ``.mean()`` / ``.std()`` for aggregate logging on WandB. ``rng`` is split
+        deterministically, so a fixed training seed reproduces the same test seeds.
+    """
+    rngs = jax.random.split(rng, n_test_seeds)
+
+    def _one(seed_rng, _):
+        stats = greedy_eval_rollout(
+            env=env,
+            agents=agents,
+            num_agents=num_agents,
+            rng=seed_rng,
+            n_env=n_env,
+            n_steps=n_steps,
+            greedy_fn=greedy_fn,
+            dict_to_agent_array=dict_to_agent_array,
+        )
+        return None, {k: v[None] for k, v in stats.items()}
+
+    _, per_seed = jax.lax.scan(_one, None, rngs)
+    return per_seed
+
+
 def greedy_eval_rollout_stateful(
     *,
     env,
