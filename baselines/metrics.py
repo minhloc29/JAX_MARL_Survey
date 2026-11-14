@@ -132,7 +132,7 @@ def greedy_eval_rollout_multiseed(
             greedy_fn=greedy_fn,
             dict_to_agent_array=dict_to_agent_array,
         )
-        return None, {k: v[None] for k, v in stats.items()}
+        return None, stats
 
     _, per_seed = jax.lax.scan(_one, None, rngs)
     return per_seed
