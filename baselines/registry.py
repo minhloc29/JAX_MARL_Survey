@@ -39,6 +39,16 @@ ALGO_REGISTRY: dict[tuple[str, str], tuple[str, str, str]] = {
     ("dcg_smax", "smax"): ("baselines/DCG/dcg_smax.py", "", ""),
     ("dicg", "smax"): ("baselines/DICG/dicg_smax.py", "", ""),
     ("dicg_smax", "smax"): ("baselines/DICG/dicg_smax.py", "", ""),
+    ("tarmac", "smax"): ("baselines/TarMAC/tarmac_smax.py", "", ""),
+    ("tarmac_smax", "smax"): ("baselines/TarMAC/tarmac_smax.py", "", ""),
+    ("ic3net", "smax"): ("baselines/IC3Net/ic3net_smax.py", "", ""),
+    ("ic3net_smax", "smax"): ("baselines/IC3Net/ic3net_smax.py", "", ""),
+    ("bicnet", "smax"): ("baselines/BiCNet/bicnet_smax.py", "", ""),
+    ("bicnet_smax", "smax"): ("baselines/BiCNet/bicnet_smax.py", "", ""),
+    ("macflow", "smax"): ("baselines/MACFlow/macflow_smax.py", "", ""),
+    ("macflow_smax", "smax"): ("baselines/MACFlow/macflow_smax.py", "", ""),
+    ("sable", "smax"): ("baselines/SABLE/sable_smax.py", "", ""),
+    ("sable_smax", "smax"): ("baselines/SABLE/sable_smax.py", "", ""),
 }
 
 # FACMAC uses its native Sacred/PyTorch runner.  The tuple contains the

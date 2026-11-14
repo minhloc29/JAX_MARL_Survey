@@ -12,6 +12,8 @@ suites:
   smax:
     seeds_per_gpu: 1
     envs:
+      - env: 3s5z
+        algos: [mat, dcg, dicg, tarmac, ic3net, bicnet, macflow, sable]
       - env: 2s3z
         algos: [ippo_rnn, mappo_rnn, qmix_rnn, vdn_rnn]
       - env: 3s5z_vs_3s6z

@@ -1,0 +1,446 @@
+"""BiCNet (Bidirectional Coordination Network) in 100% JAX/Flax for SMAX.
+
+Based on:
+- 'Multiagent Bidirectionally-Coordinated Nets for Distributed Decision Making' (Peng et al., 2017)
+- Reference: temp/BiCNet/network.py
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import time
+from typing import NamedTuple, Sequence
+
+import distrax
+import flax.linen as nn
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax.linen.initializers import constant, orthogonal
+from flax.training.train_state import TrainState
+from omegaconf import OmegaConf
+
+import wandb
+from jaxmarl import make
+from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
+from jaxmarl.wrappers.baselines import SMAXLogWrapper
+
+
+# =============================================================================
+# BiCNet Architecture
+# =============================================================================
+
+class BiDirectionalCoordination(nn.Module):
+    rnn_dim: int
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """Bidirectional recurrent communication across agent sequence.
+        
+        Args:
+            x: (batch, n_agents, feature_dim)
+        Returns:
+            coordinated representations: (batch, n_agents, 2 * rnn_dim)
+        """
+        batch_size, n_agents, _ = x.shape
+
+        fwd_in = nn.Dense(3 * self.rnn_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name="fwd_in")(x)
+        bwd_in = nn.Dense(3 * self.rnn_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name="bwd_in")(x)
+
+        # Explicit recurrent parameter matrices: (rnn_dim, 3 * rnn_dim)
+        w_fwd_h = self.param("w_fwd_h", orthogonal(np.sqrt(2)), (self.rnn_dim, 3 * self.rnn_dim))
+        w_bwd_h = self.param("w_bwd_h", orthogonal(np.sqrt(2)), (self.rnn_dim, 3 * self.rnn_dim))
+
+        # Swap to sequence first: (n_agents, batch, 3 * rnn_dim)
+        fwd_seq = jnp.swapaxes(fwd_in, 0, 1)
+        bwd_seq = jnp.swapaxes(bwd_in, 0, 1)
+
+        def gru_step(w_h, h, in_gates):
+            h_gates = jnp.matmul(h, w_h)
+            z_in, r_in, n_in = jnp.split(in_gates, 3, axis=-1)
+            z_h, r_h, n_h = jnp.split(h_gates, 3, axis=-1)
+            z = jax.nn.sigmoid(z_in + z_h)
+            r = jax.nn.sigmoid(r_in + r_h)
+            n = jnp.tanh(n_in + r * n_h)
+            new_h = (1.0 - z) * h + z * n
+            return new_h, new_h
+
+        # Forward scan (agent 0 -> agent N-1)
+        init_h = jnp.zeros((batch_size, self.rnn_dim))
+        _, fwd_outs = jax.lax.scan(lambda h, inp: gru_step(w_fwd_h, h, inp), init_h, fwd_seq)
+
+        # Backward scan (agent N-1 -> agent 0)
+        bwd_seq_rev = jnp.flip(bwd_seq, axis=0)
+        _, bwd_outs_rev = jax.lax.scan(lambda h, inp: gru_step(w_bwd_h, h, inp), init_h, bwd_seq_rev)
+        bwd_outs = jnp.flip(bwd_outs_rev, axis=0)
+
+        # Concatenate forward and backward representations
+        bicnet_seq = jnp.concatenate([fwd_outs, bwd_outs], axis=-1)  # (n_agents, batch, 2*rnn_dim)
+        bicnet_out = jnp.swapaxes(bicnet_seq, 0, 1)  # (batch, n_agents, 2*rnn_dim)
+        return bicnet_out
+
+
+class BiCNetActorCritic(nn.Module):
+    action_dim: int
+    n_agents: int
+    hidden_dim: int = 64
+    rnn_dim: int = 64
+
+    @nn.compact
+    def __call__(
+        self,
+        obs: jax.Array,
+        avail_actions: jax.Array,
+    ) -> tuple[distrax.Categorical, jax.Array]:
+        """Forward pass for BiCNet actor and centralized critic.
+        
+        Args:
+            obs: (batch, n_agents, obs_dim)
+            avail_actions: (batch, n_agents, action_dim)
+        """
+        batch_size, n_agents, _ = obs.shape
+
+        # 1. Feature encoder per agent
+        e = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(obs)
+        e = nn.relu(e)
+
+        # 2. Bidirectional coordination communication across agents
+        comm = BiDirectionalCoordination(rnn_dim=self.rnn_dim)(e)
+
+        # 3. Combine local features and bidirectional context
+        combined = jnp.concatenate([e, comm], axis=-1)
+        h = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(combined)
+        h = nn.relu(h)
+
+        # 4. Policy Head
+        logits = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(h)
+        large_neg = -1e10
+        masked_logits = jnp.where(avail_actions > 0.5, logits, large_neg)
+        pi = distrax.Categorical(logits=masked_logits)
+
+        # 5. Centralized Critic Head
+        flat_obs = obs.reshape(batch_size, -1)
+        v = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(flat_obs)
+        v = nn.relu(v)
+        v = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(v)
+        value = jnp.tile(v, (1, n_agents))
+
+        return pi, value
+
+
+# =============================================================================
+# Training Pipeline
+# =============================================================================
+
+class Transition(NamedTuple):
+    done: jnp.ndarray          # (n_envs,)
+    action: jnp.ndarray        # (n_envs, n_agents)
+    value: jnp.ndarray         # (n_envs, n_agents)
+    reward: jnp.ndarray        # (n_envs, n_agents)
+    log_prob: jnp.ndarray      # (n_envs, n_agents)
+    obs: jnp.ndarray           # (n_envs, n_agents, obs_dim)
+    info: dict
+    avail_actions: jnp.ndarray # (n_envs, n_agents, act_dim)
+
+
+def make_train(config: dict):
+    scenario = map_name_to_scenario(config["MAP_NAME"])
+    env = HeuristicEnemySMAX(scenario=scenario, **config["ENV_KWARGS"])
+    env = SMAXLogWrapper(env)
+
+    num_agents = env.num_agents
+    action_dim = env.action_space(env.agents[0]).n
+    obs_dim = env.observation_space(env.agents[0]).shape[0]
+
+    config["NUM_UPDATES"] = int(
+        (config["TOTAL_TIMESTEPS"] + config["NUM_STEPS"] * config["NUM_ENVS"] - 1)
+        // (config["NUM_STEPS"] * config["NUM_ENVS"])
+    )
+    config["MINIBATCH_SIZE"] = (
+        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+    )
+
+    def linear_schedule(count):
+        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
+        return config["LR"] * jnp.maximum(frac, 0.0)
+
+    def train(rng: jax.Array):
+        # 1. Initialize Network
+        model = BiCNetActorCritic(
+            action_dim=action_dim,
+            n_agents=num_agents,
+            hidden_dim=config["HIDDEN_DIM"],
+            rnn_dim=config["RNN_DIM"],
+        )
+
+        rng, rng_init = jax.random.split(rng)
+        dummy_obs = jnp.zeros((config["NUM_ENVS"], num_agents, obs_dim))
+        dummy_avail = jnp.ones((config["NUM_ENVS"], num_agents, action_dim))
+
+        params = model.init(rng_init, obs=dummy_obs, avail_actions=dummy_avail)
+
+        tx = optax.chain(
+            optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+            optax.adam(
+                learning_rate=linear_schedule if config["ANNEAL_LR"] else config["LR"],
+                eps=1e-5,
+            ),
+        )
+        train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+
+        # 2. Reset Parallel Environments
+        rng, rng_reset = jax.random.split(rng)
+        reset_rngs = jax.random.split(rng_reset, config["NUM_ENVS"])
+        obs_dict, env_state = jax.vmap(env.reset)(reset_rngs)
+
+        def dict_to_agent_array(d, agent_list):
+            return jnp.stack([d[agent] for agent in agent_list], axis=1)
+
+        last_obs = dict_to_agent_array(obs_dict, env.agents)
+        last_done = jnp.zeros(config["NUM_ENVS"], dtype=jnp.bool_)
+
+        def _log_update(metrics, update_index):
+            if wandb.run is not None:
+                wandb.log(
+                    {key: float(value) for key, value in metrics.items()},
+                    step=int(update_index)
+                    * int(config["NUM_STEPS"])
+                    * int(config["NUM_ENVS"]),
+                )
+
+        # 3. Main Update Loop
+        def _update_step(runner_state, update_index):
+            train_state, env_state, last_obs, last_done, rng = runner_state
+
+            # --- ROLLOUT ---
+            def _env_step(carry, _):
+                env_state, last_obs, last_done, rng = carry
+                rng, rng_avail, rng_act, rng_step = jax.random.split(rng, 4)
+
+                avail_actions_dict = jax.vmap(env.get_avail_actions)(env_state.env_state)
+                avail_actions = dict_to_agent_array(avail_actions_dict, env.agents)
+
+                pi, value = model.apply(
+                    train_state.params,
+                    obs=last_obs,
+                    avail_actions=avail_actions,
+                )
+                action = pi.sample(seed=rng_act)
+                log_prob = pi.log_prob(action)
+
+                actions_dict = {
+                    agent: action[:, i] for i, agent in enumerate(env.agents)
+                }
+
+                step_rngs = jax.random.split(rng_step, config["NUM_ENVS"])
+                obs_dict, env_state, rewards_dict, dones_dict, infos = jax.vmap(
+                    env.step
+                )(step_rngs, env_state, actions_dict)
+
+                obs = dict_to_agent_array(obs_dict, env.agents)
+                reward = dict_to_agent_array(rewards_dict, env.agents)
+                done = dones_dict["__all__"]
+
+                transition = Transition(
+                    done=last_done,
+                    action=action,
+                    value=value,
+                    reward=reward,
+                    log_prob=log_prob,
+                    obs=last_obs,
+                    info=infos,
+                    avail_actions=avail_actions,
+                )
+
+                carry = (env_state, obs, done, rng)
+                return carry, transition
+
+            runner_carry = (env_state, last_obs, last_done, rng)
+            runner_carry, traj_batch = jax.lax.scan(
+                _env_step, runner_carry, None, length=config["NUM_STEPS"]
+            )
+            env_state, last_obs, last_done, rng = runner_carry
+
+            # --- GAE CALCULATION ---
+            avail_actions_dict = jax.vmap(env.get_avail_actions)(env_state.env_state)
+            avail_actions = dict_to_agent_array(avail_actions_dict, env.agents)
+            _, last_val = model.apply(
+                train_state.params,
+                obs=last_obs,
+                avail_actions=avail_actions,
+            )
+
+            def _calculate_gae(traj_batch, last_val, last_done):
+                def _get_advantages(carry, transition_and_done):
+                    gae, next_val, next_done = carry
+                    transition, done = transition_and_done
+                    delta = (
+                        transition.reward
+                        + config["GAMMA"] * next_val * (1.0 - next_done[:, None])
+                        - transition.value
+                    )
+                    gae = (
+                        delta
+                        + config["GAMMA"]
+                        * config["GAE_LAMBDA"]
+                        * (1.0 - next_done[:, None])
+                        * gae
+                    )
+                    return (gae, transition.value, done), gae
+
+                _, advantages = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(last_val), last_val, last_done),
+                    (traj_batch, traj_batch.done),
+                    reverse=True,
+                )
+                returns = advantages + traj_batch.value
+                return advantages, returns
+
+            advantages, targets = _calculate_gae(traj_batch, last_val, last_done)
+
+            # --- PPO UPDATE ---
+            def _update_epoch(update_state, _):
+                def _update_minibatch(train_state, batch_info):
+                    traj_batch, advantages, targets = batch_info
+
+                    def _loss_fn(params):
+                        pi, value = model.apply(
+                            params,
+                            obs=traj_batch.obs,
+                            avail_actions=traj_batch.avail_actions,
+                        )
+                        log_prob = pi.log_prob(traj_batch.action)
+
+                        # Policy Loss
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        norm_adv = (advantages - advantages.mean()) / (
+                            advantages.std() + 1e-8
+                        )
+                        surr1 = ratio * norm_adv
+                        surr2 = (
+                            jnp.clip(
+                                ratio,
+                                1.0 - config["CLIP_EPS"],
+                                1.0 + config["CLIP_EPS"],
+                            )
+                            * norm_adv
+                        )
+                        actor_loss = -jnp.minimum(surr1, surr2).mean()
+
+                        # Value Loss
+                        v_clipped = traj_batch.value + jnp.clip(
+                            value - traj_batch.value,
+                            -config["CLIP_EPS"],
+                            config["CLIP_EPS"],
+                        )
+                        v_loss1 = jnp.square(value - targets)
+                        v_loss2 = jnp.square(v_clipped - targets)
+                        critic_loss = 0.5 * jnp.maximum(v_loss1, v_loss2).mean()
+
+                        # Entropy Loss
+                        entropy = pi.entropy().mean()
+
+                        total_loss = (
+                            actor_loss
+                            + config["VF_COEF"] * critic_loss
+                            - config["ENT_COEF"] * entropy
+                        )
+                        return total_loss, (actor_loss, critic_loss, entropy)
+
+                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                    (loss, (a_loss, c_loss, ent)), grads = grad_fn(train_state.params)
+                    train_state = train_state.apply_gradients(grads=grads)
+                    return train_state, (loss, a_loss, c_loss, ent)
+
+                train_state, traj_batch, advantages, targets, rng = update_state
+                rng, rng_perm = jax.random.split(rng)
+
+                batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
+                perm = jax.random.permutation(rng_perm, batch_size)
+
+                batch = jax.tree_util.tree_map(
+                    lambda x: x.reshape((batch_size,) + x.shape[2:]),
+                    (traj_batch, advantages, targets),
+                )
+                shuffled_batch = jax.tree_util.tree_map(
+                    lambda x: jnp.take(x, perm, axis=0), batch
+                )
+                minibatches = jax.tree_util.tree_map(
+                    lambda x: jnp.reshape(
+                        x, (config["NUM_MINIBATCHES"], -1) + x.shape[1:]
+                    ),
+                    shuffled_batch,
+                )
+
+                train_state, (loss, a_loss, c_loss, ent) = jax.lax.scan(
+                    _update_minibatch, train_state, minibatches
+                )
+                return (train_state, traj_batch, advantages, targets, rng), (
+                    loss,
+                    a_loss,
+                    c_loss,
+                    ent,
+                )
+
+            update_state = (train_state, traj_batch, advantages, targets, rng)
+            update_state, (loss, a_loss, c_loss, ent) = jax.lax.scan(
+                _update_epoch, update_state, None, length=config["UPDATE_EPOCHS"]
+            )
+            train_state = update_state[0]
+            rng = update_state[-1]
+
+            # --- METRICS & LOGGING ---
+            metrics = {
+                "loss": loss.mean(),
+                "actor_loss": a_loss.mean(),
+                "critic_loss": c_loss.mean(),
+                "entropy": ent.mean(),
+                "returned_won_episode": jnp.mean(traj_batch.info["returned_won_episode"]),
+                "returned_episode_returns": jnp.mean(
+                    traj_batch.info["returned_episode_returns"]
+                ),
+                "returned_episode_lengths": jnp.mean(
+                    traj_batch.info["returned_episode_lengths"]
+                ),
+                "returned_episode": jnp.mean(traj_batch.info["returned_episode"]),
+            }
+            jax.debug.callback(_log_update, metrics, update_index + 1)
+
+            runner_state = (train_state, env_state, last_obs, last_done, rng)
+            return runner_state, metrics
+
+        # 4. Run All Updates via lax.scan
+        runner_state = (train_state, env_state, last_obs, last_done, rng)
+        runner_state, metrics = jax.lax.scan(
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
+        )
+        return {"runner_state": runner_state, "metrics": metrics}
+
+    return train
+
+
+@hydra.main(version_base=None, config_path="config", config_name="bicnet_smax")
+def main(config):
+    config = OmegaConf.to_container(config)
+
+    wandb.init(
+        entity=config.get("ENTITY", None),
+        project=config["WANDB_PROJECT"],
+        tags=["BICNET", "SMAX", config["MAP_NAME"]],
+        config=config,
+        mode=config["WANDB_MODE"],
+    )
+
+    rng = jax.random.PRNGKey(config.get("SEED", 42))
+    train_jit = jax.jit(make_train(config))
+    out = train_jit(rng)
+    wandb.finish()
+    print("BiCNet training on SMAX 3s5z completed successfully!")
+
+
+if __name__ == "__main__":
+    main()

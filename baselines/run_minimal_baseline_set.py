@@ -184,6 +184,11 @@ def build_cmd(
         "baselines/MAT/mat_smax.py",
         "baselines/DCG/dcg_smax.py",
         "baselines/DICG/dicg_smax.py",
+        "baselines/TarMAC/tarmac_smax.py",
+        "baselines/IC3Net/ic3net_smax.py",
+        "baselines/BiCNet/bicnet_smax.py",
+        "baselines/MACFlow/macflow_smax.py",
+        "baselines/SABLE/sable_smax.py",
     }:
         # These standalone configs use WANDB_PROJECT and intentionally do not
         # declare the legacy launcher keys used by the other JAX baselines.

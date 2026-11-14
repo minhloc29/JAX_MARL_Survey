@@ -56,7 +56,7 @@ python -m baselines.cli \
 # ====================================================
 XLA_PYTHON_CLIENT_PREALLOCATE=true \
 python -m baselines.cli \
-  --algorithm i2c \
+  --algorithm mat \
   --suite smax \
   --env 3s5z \
   --steps 128 \
@@ -88,7 +88,7 @@ python -m baselines.cli \
 # ====================================================
 XLA_PYTHON_CLIENT_PREALLOCATE=true \
 python -m baselines.cli \
-  --algorithm dcg \
+  --algorithm dicg \
   --suite smax \
   --env 3s5z \
   --steps 128 \
@@ -99,6 +99,81 @@ python -m baselines.cli \
   --wandb-mode online
 
 
+# ====================================================
+# 4. TarMAC (Targeted Multi-Agent Communication) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm tarmac \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
 
 
-dcg, rode, i2c: failed
+# ====================================================
+# 5. IC3Net (Individual Controlled Continuous Communication) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm ic3net \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+# ====================================================
+# 6. BiCNet (Bidirectional Coordination Network) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm bicnet \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+# ====================================================
+# 7. MAC-Flow (Continuous Normalizing Flow / Flow Matching) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm macflow \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online
+
+
+# ====================================================
+# 8. SABLE (Scalable Agent-By-Agent LEarning / RetNet) on SMAX 3s5z
+# ====================================================
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
+python -m baselines.cli \
+  --algorithm sable \
+  --suite smax \
+  --env 3s5z \
+  --steps 128 \
+  --num-envs 16 \
+  --total-timesteps 5000000 \
+  --gpus 0 \
+  --project jaxmarl \
+  --wandb-mode online

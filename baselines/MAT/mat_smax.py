@@ -500,7 +500,6 @@ def make_train(config: dict):
 @hydra.main(version_base=None, config_path="config", config_name="mat_smax")
 def main(config):
     config = OmegaConf.to_container(config)
-123456aA@
     wandb.init(
         entity=config.get("ENTITY", None),
         project=config["WANDB_PROJECT"],
