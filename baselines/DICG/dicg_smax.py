@@ -423,7 +423,7 @@ def make_train(config: dict):
             def _run_eval(rng):
                 def greedy_fn(obs, avail):
                     return model.apply(
-                        params=train_state.params,
+                        train_state.params,
                         obs=obs,
                         avail_actions=avail,
                         method=model.get_greedy_actions,
