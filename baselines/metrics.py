@@ -121,7 +121,7 @@ def greedy_eval_rollout_multiseed(
     """
     rngs = jax.random.split(rng, n_test_seeds)
 
-    def _one(seed_rng, _):
+    def _one(_, seed_rng):
         stats = greedy_eval_rollout(
             env=env,
             agents=agents,
