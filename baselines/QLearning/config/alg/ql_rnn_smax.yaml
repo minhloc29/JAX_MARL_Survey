@@ -34,3 +34,4 @@
 "TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
 "TEST_NUM_STEPS": 128
 "TEST_NUM_ENVS": 512 # number of episodes to average over, can affect performance
+"TEST_NUM_SEEDS": 5 # number of test seeds to average mean/std over

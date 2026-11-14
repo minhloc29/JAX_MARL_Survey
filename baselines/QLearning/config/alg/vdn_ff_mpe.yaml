@@ -27,4 +27,6 @@
 "TEST_NUM_STEPS": 30
 "TEST_NUM_ENVS": 512
 
+"TEST_NUM_SEEDS": 5 # number of test seeds to average mean/std over
+
 "ALG_NAME": "vdn_ff"

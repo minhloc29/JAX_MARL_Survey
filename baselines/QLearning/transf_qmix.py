@@ -29,6 +29,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from baselines.metrics import eval_multiseed_scan, test_means_stds
 from jaxmarl import make
 from jaxmarl.environments.smax import map_name_to_scenario
 from jaxmarl.wrappers.baselines import MPELogWrapper, SMAXLogWrapper
@@ -1004,7 +1005,16 @@ def make_train(config, env):
                 time_state["updates"]
                 % (config["TEST_INTERVAL"] // config["NUM_STEPS"] // config["NUM_ENVS"])
                 == 0,
-                lambda _: get_greedy_metrics(_rng, train_state, time_state),
+                lambda _: eval_multiseed_scan(
+                    lambda key: {
+                        k[len("test_"):]: v.mean()
+                        for k, v in get_greedy_metrics(
+                            key, train_state, time_state
+                        ).items()
+                    },
+                    int(config.get("TEST_NUM_SEEDS", 5)),
+                    _rng,
+                ),
                 lambda _: test_metrics,
                 operand=None,
             )
@@ -1038,7 +1048,7 @@ def make_train(config, env):
                         {
                             **metrics["running_metrics"],
                             **info_metrics,
-                            **{k: v.mean() for k, v in metrics["test_metrics"].items()},
+                            **test_means_stds(metrics["test_metrics"]),
                         }
                     )
 
@@ -1152,10 +1162,15 @@ def make_train(config, env):
             return metrics
 
         time_state = {"timesteps": jnp.array(0), "updates": jnp.array(0)}
-        rng, _rng = jax.random.split(rng)
-        test_metrics = get_greedy_metrics(
-            _rng, train_state, time_state
-        )  # initial greedy metrics
+        n_test_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+        _zero_none = jnp.zeros((n_test_seeds,))
+        test_metrics = {
+            "returns": _zero_none,
+            "returned_won_episode": _zero_none,
+            "returned_episode_returns": _zero_none,
+            "returned_episode_lengths": _zero_none,
+            "returned_episode": _zero_none,
+        }  # initial greedy metrics (per-test-seed)
 
         # train
         rng, _rng = jax.random.split(rng)

@@ -24,6 +24,8 @@
 "WANDB_ONLINE_REPORT": True
 "NUM_TEST_EPISODES": 32
 "TEST_INTERVAL": 50000
+
+"TEST_NUM_SEEDS": 5 # number of test seeds to average mean/std over
 "SAMPLE_SIZE": 5
 "MANUAL_ALPHA_ESTIMATES": null
 "LR_ALPHA": 0.001

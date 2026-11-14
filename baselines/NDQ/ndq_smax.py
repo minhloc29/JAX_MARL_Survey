@@ -26,10 +26,18 @@ from jaxmarl.environments.smax import map_name_to_scenario
 from jaxmarl.wrappers.baselines import CTRolloutManager, SMAXLogWrapper
 
 try:
-    from baselines.metrics import finished_episode_stats, log_metrics
+    from baselines.metrics import (
+        finished_episode_stats,
+        log_metrics,
+        test_means_stds,
+    )
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from baselines.metrics import finished_episode_stats, log_metrics
+    from baselines.metrics import (
+        finished_episode_stats,
+        log_metrics,
+        test_means_stds,
+    )
 
 
 class AgentQNetwork(nn.Module):
@@ -161,7 +169,7 @@ def make_train(config: dict[str, Any]):
             next_hidden, q_values, mu, sigma, messages = forward_batch(
                 state.params, hidden, _stack(obs, agents), comm_keys, True
             )
-            valid_dict = wrapped_env.get_valid_actions(env_state)
+            valid_dict = wrapped_env.get_valid_actions(env_state.env_state)
             valid = jnp.stack([valid_dict[agent] for agent in agents], axis=1)
             epsilon = epsilon_schedule(rollout_index * rollout_steps)
             greedy = jnp.argmax(jnp.where(valid, q_values, -1e10), axis=-1)
@@ -187,7 +195,7 @@ def make_train(config: dict[str, Any]):
             next_obs, next_state, rewards, dones, infos = wrapped_env.batch_step(
                 step_key, env_state, action_dict
             )
-            next_valid_dict = wrapped_env.get_valid_actions(next_state)
+            next_valid_dict = wrapped_env.get_valid_actions(next_state.env_state)
             next_valid = jnp.stack(
                 [next_valid_dict[agent] for agent in agents], axis=1
             )
@@ -301,7 +309,7 @@ def make_train(config: dict[str, Any]):
                 _, q_values, _, _, _ = forward_batch(
                     state.params, hidden, _stack(obs, agents), comm_keys, False
                 )
-                valid_dict = eval_env.get_valid_actions(env_st)
+                valid_dict = eval_env.get_valid_actions(env_st.env_state)
                 valid = jnp.stack([valid_dict[agent] for agent in agents], axis=1)
                 greedy = jnp.argmax(jnp.where(valid, q_values, -1e10), axis=-1)
                 action_dict = {agent: greedy[:, i] for i, agent in enumerate(agents)}
@@ -351,7 +359,15 @@ def make_train(config: dict[str, Any]):
             test_metrics = {}
             if int(config.get("TEST_DURING_TRAINING", False)) and (update + 1) % eval_interval == 0:
                 rng, eval_key = jax.random.split(rng)
-                test_metrics = _run_eval(eval_key)
+                n_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+                seed_keys = list(jax.random.split(eval_key, n_seeds))
+                per_run = [_run_eval(k) for k in seed_keys]
+                # per-stat: (n_seeds,) array from the list of per-seed dicts
+                per_seed = {
+                    key: jnp.stack([d[key] for d in per_run])
+                    for key in per_run[0]
+                }
+                test_metrics = test_means_stds(per_seed)
 
             metrics = {                "loss/total": float(loss),
                 "loss/td_error_abs": float(jnp.abs(td).mean()),
@@ -378,7 +394,7 @@ def make_train(config: dict[str, Any]):
                 "training/timesteps": timesteps,
                 "training/updates_per_second": (update + 1) / max(time.time() - start_time, 1e-6),
             }
-            metrics.update({"test_" + k: v for k, v in test_metrics.items()})
+            metrics.update(test_metrics)
             log_metrics(metrics, step=timesteps)
             metrics_history.append(metrics)
             print(
@@ -428,6 +444,7 @@ def main() -> None:
         "TEST_INTERVAL": 0.05,
         "TEST_NUM_STEPS": 128,
         "TEST_NUM_ENVS": 512,
+        "TEST_NUM_SEEDS": 5,
     }
     for argument in sys.argv[1:]:
         if "=" not in argument:

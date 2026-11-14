@@ -92,6 +92,45 @@ def greedy_eval_rollout(
     return finished_episode_stats(infos, num_agents)
 
 
+def test_means_stds(per_seed: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
+    """Map per-seed eval stats to a ``test_<stat>/mean`` + ``test_<stat>/std`` dict.
+
+    ``per_seed`` maps each stat (e.g. ``returned_won_episode``) to an array of
+    shape ``(n_test_seeds,)``. Returns flat keys ready for ``wandb.log``:
+    ``test_returned_won_episode/mean`` and ``test_returned_won_episode/std``.
+    This is the shared convention across all JAX baselines.
+    """
+    out: dict[str, jax.Array] = {}
+    for k, v in per_seed.items():
+        out[f"test_{k}/mean"] = jnp.mean(v)
+        out[f"test_{k}/std"] = jnp.std(v)
+    return out
+
+
+def eval_multiseed_scan(
+    single_eval, n_test_seeds: int, rng: jax.Array
+) -> dict[str, jax.Array]:
+    """Run ``single_eval`` over ``n_test_seeds`` independent PRNG keys.
+
+    ``single_eval`` is any pure callable mapping a scalar PRNG key to a dict of
+    scalars (e.g. a closure around an algorithm's ``get_greedy_metrics(rng, ...)``).
+    This runs it sequentially over seeds via ``lax.scan``, which composes correctly
+    even when ``single_eval`` itself ``vmap``-batches many environments internally
+    (a naive ``jax.vmap`` over the seed axis would collide with that inner axis).
+
+    Returns:
+        dict mapping each output key to an array of shape ``(n_test_seeds,)``.
+        Reduce with :func:`eval_means_stds` for mean/std logging on WandB.
+    """
+    rngs = jax.random.split(rng, n_test_seeds)
+
+    def _one(_, seed_rng):
+        return None, single_eval(seed_rng)
+
+    _, per_seed = jax.lax.scan(_one, None, rngs)
+    return per_seed
+
+
 def greedy_eval_rollout_multiseed(
     *,
     env,

@@ -16,7 +16,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
-from baselines.metrics import log_metrics
+from baselines.metrics import eval_multiseed_scan, log_metrics, test_means_stds
 from jaxmarl import make
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.smax import map_name_to_scenario
@@ -470,11 +470,15 @@ def make_train(config, env):
                     train_state.n_updates
                     % int(config["NUM_UPDATES"] * config["TEST_INTERVAL"])
                     == 0,
-                    lambda _: get_greedy_metrics(_rng, train_state),
+                    lambda _: eval_multiseed_scan(
+                        lambda key: get_greedy_metrics(key, train_state),
+                        int(config.get("TEST_NUM_SEEDS", 5)),
+                        _rng,
+                    ),
                     lambda _: test_state,
                     operand=None,
                 )
-                metrics.update({"test_" + k: v for k, v in test_state.items()})
+                metrics.update(test_means_stds(test_state))
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
@@ -557,7 +561,14 @@ def make_train(config, env):
             return metrics
 
         rng, _rng = jax.random.split(rng)
-        test_state = get_greedy_metrics(_rng, train_state)
+        n_test_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+        _zero_none = jnp.zeros((n_test_seeds,))
+        test_state = {
+            "returned_won_episode": _zero_none,
+            "returned_episode_returns": _zero_none,
+            "returned_episode_lengths": _zero_none,
+            "returned_episode": _zero_none,
+        }
 
         # train
         rng, _rng = jax.random.split(rng)
