@@ -8,6 +8,7 @@ ALGO_REGISTRY: dict[tuple[str, str], tuple[str, str, str]] = {
     ("mappo_rnn", "mpe"): ("baselines/MAPPO/mappo_rnn_mpe.py", "", ""),
     ("qmix_rnn", "mpe"): ("baselines/QLearning/qmix_rnn.py", "ql_rnn_mpe", "alg."),
     ("vdn_rnn", "mpe"): ("baselines/QLearning/vdn_rnn.py", "ql_rnn_mpe", "alg."),
+    ("iql_rnn", "mpe"): ("baselines/QLearning/iql_rnn.py", "ql_rnn_mpe", "alg."),
     ("vdn_ff", "mpe"): ("baselines/QLearning/vdn_ff.py", "vdn_ff_mpe", "alg."),
     ("ippo_rnn", "smax"): ("baselines/IPPO/ippo_rnn_smax.py", "", ""),
     ("mappo_rnn", "smax"): ("baselines/MAPPO/mappo_rnn_smax.py", "", ""),
@@ -16,6 +17,8 @@ ALGO_REGISTRY: dict[tuple[str, str], tuple[str, str, str]] = {
     ("ndq", "smax"): ("baselines/NDQ/ndq_smax.py", "ndq_smax", "alg."),
     ("ndo", "smax"): ("baselines/NDQ/ndq_smax.py", "ndq_smax", "alg."),
     ("vdn_rnn", "smax"): ("baselines/QLearning/vdn_rnn.py", "ql_rnn_smax", "alg."),
+    ("iql_rnn", "smax"): ("baselines/QLearning/iql_rnn.py", "ql_rnn_smax", "alg."),
+    ("iql_rnn", "mpe"): ("baselines/QLearning/iql_rnn.py", "ql_rnn_mpe", "alg."),
     ("facmac_smac", "smax"): (
         "baselines/FACMAC/facmac.py",
         "facmac_smac",
