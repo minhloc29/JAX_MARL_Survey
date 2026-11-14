@@ -524,11 +524,12 @@ def make_train(config):
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps, new_test_state), metric
 
+        n_seeds = int(config.get("TEST_NUM_SEEDS", 5))
         test_template = {
-            "returned_won_episode": jnp.asarray(0.0),
-            "returned_episode_returns": jnp.asarray(0.0),
-            "returned_episode_lengths": jnp.asarray(0.0),
-            "returned_episode": jnp.asarray(0.0),
+            "returned_won_episode": jnp.zeros((n_seeds,)),
+            "returned_episode_returns": jnp.zeros((n_seeds,)),
+            "returned_episode_lengths": jnp.zeros((n_seeds,)),
+            "returned_episode": jnp.zeros((n_seeds,)),
         }
         rng, _rng = jax.random.split(rng)
         runner_state = (
