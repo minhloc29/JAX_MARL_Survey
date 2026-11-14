@@ -217,14 +217,18 @@ def finished_episode_stats(infos, num_agents: int):
     infos leaves have shape (steps, envs, agents). The wrapper repeats the last
     finished episode's value on every step, so each value is weighted by the
     'returned_episode' flag (1 only on the step where an episode just ended).
+
+    Output keys mirror the SMAXLogWrapper vocabulary (returned_won_episode,
+    returned_episode_returns, returned_episode_lengths, returned_episode) so each
+    baseline logs a consistent metric schema.
     """
     done_ep = infos["returned_episode"].astype(jnp.float32)
     n = jnp.maximum(done_ep.sum(), 1.0)
     return {
-        "won_rate": (infos["returned_won_episode"] * done_ep).sum() / n,
-        "returns": (infos["returned_episode_returns"] * done_ep).sum() / n,
-        "episode_length": (infos["returned_episode_lengths"] * done_ep).sum() / n,
-        "n_episodes": done_ep.sum() / num_agents,
+        "returned_won_episode": (infos["returned_won_episode"] * done_ep).sum() / n,
+        "returned_episode_returns": (infos["returned_episode_returns"] * done_ep).sum() / n,
+        "returned_episode_lengths": (infos["returned_episode_lengths"] * done_ep).sum() / n,
+        "returned_episode": done_ep.sum() / num_agents,
     }
 
 

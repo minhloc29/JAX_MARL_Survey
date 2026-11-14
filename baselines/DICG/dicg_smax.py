@@ -24,6 +24,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from baselines.metrics import log_metrics
 from jaxmarl import make
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -248,7 +249,7 @@ def make_train(config: dict):
 
         # 3. Main Update Loop
         def _log_update(metrics, update_index):
-            wandb.log(
+            log_metrics(
                 {key: float(value) for key, value in metrics.items()},
                 step=int(update_index)
                 * int(config["NUM_STEPS"])

@@ -16,6 +16,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from baselines.metrics import log_metrics
 from jaxmarl import make
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.smax import map_name_to_scenario
@@ -486,7 +487,7 @@ def make_train(config, env):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics, step=int(metrics["env_step"]))
+                    log_metrics(metrics, step=int(metrics["env_step"]))
 
                 jax.debug.callback(callback, metrics, original_seed)
 

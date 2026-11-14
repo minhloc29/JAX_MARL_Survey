@@ -19,6 +19,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from baselines.metrics import log_metrics
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import JaxMARLWrapper, SMAXLogWrapper
 
@@ -593,7 +594,7 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
-                wandb.log(
+                log_metrics(
                     {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.

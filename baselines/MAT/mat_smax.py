@@ -24,6 +24,7 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from baselines.metrics import log_metrics
 from jaxmarl import make
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -304,7 +305,7 @@ def make_train(config: dict):
         last_done = jnp.zeros(config["NUM_ENVS"], dtype=jnp.bool_)
 
         def _log_update(metrics, update_index):
-            wandb.log(
+            log_metrics(
                 {key: float(value) for key, value in metrics.items()},
                 step=int(update_index)
                 * int(config["NUM_STEPS"])
@@ -500,7 +501,7 @@ def make_train(config: dict):
 @hydra.main(version_base=None, config_path="config", config_name="mat_smax")
 def main(config):
     config = OmegaConf.to_container(config)
-123456aA@
+
     wandb.init(
         entity=config.get("ENTITY", None),
         project=config["WANDB_PROJECT"],
