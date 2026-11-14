@@ -24,3 +24,11 @@ ENV_KWARGS: {}
 WANDB_PROJECT: "jaxmarl"
 WANDB_MODE: "disabled"
 WANDB_GROUP: "sable_smax"
+
+# Periodic greedy evaluation (epsilon = 0) during training
+TEST_DURING_TRAINING: True
+TEST_INTERVAL: 0.05   # fraction of updates; eval every TEST_INTERVAL * NUM_UPDATES
+TEST_NUM_STEPS: 128
+TEST_NUM_ENVS: 128    # parallel eval environments
+TEST_NUM_SEEDS: 5     # independent test seeds; mean/std logged to WandB
+

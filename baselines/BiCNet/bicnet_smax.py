@@ -24,6 +24,11 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+from baselines.metrics import (
+    finished_episode_stats,
+    greedy_eval_rollout_multiseed,
+    log_metrics,
+)
 from jaxmarl import make
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -130,6 +135,12 @@ class BiCNetActorCritic(nn.Module):
 
         return pi, value
 
+    def get_greedy_actions(
+        self, obs: jax.Array, avail_actions: jax.Array
+    ) -> jax.Array:
+        pi, _ = self(obs, avail_actions)
+        return jnp.argmax(pi.logits, axis=-1)
+
 
 # =============================================================================
 # Training Pipeline
@@ -203,17 +214,16 @@ def make_train(config: dict):
         last_done = jnp.zeros(config["NUM_ENVS"], dtype=jnp.bool_)
 
         def _log_update(metrics, update_index):
-            if wandb.run is not None:
-                wandb.log(
-                    {key: float(value) for key, value in metrics.items()},
-                    step=int(update_index)
-                    * int(config["NUM_STEPS"])
-                    * int(config["NUM_ENVS"]),
-                )
+            log_metrics(
+                {key: float(value) for key, value in metrics.items()},
+                step=int(update_index)
+                * int(config["NUM_STEPS"])
+                * int(config["NUM_ENVS"]),
+            )
 
         # 3. Main Update Loop
         def _update_step(runner_state, update_index):
-            train_state, env_state, last_obs, last_done, rng = runner_state
+            train_state, env_state, last_obs, last_done, rng, test_state = runner_state
 
             # --- ROLLOUT ---
             def _env_step(carry, _):
@@ -393,6 +403,39 @@ def make_train(config: dict):
             train_state = update_state[0]
             rng = update_state[-1]
 
+            # Periodic greedy evaluation (epsilon = 0) during training
+            eval_interval = max(
+                1, int(config.get("TEST_INTERVAL", 0.05) * config["NUM_UPDATES"])
+            )
+
+            def _run_eval(rng):
+                def greedy_fn(obs, avail):
+                    return model.apply(
+                        train_state.params,
+                        obs=obs,
+                        avail_actions=avail,
+                        method=model.get_greedy_actions,
+                    )
+
+                return greedy_eval_rollout_multiseed(
+                    env=env,
+                    agents=env.agents,
+                    num_agents=num_agents,
+                    rng=rng,
+                    n_test_seeds=int(config.get("TEST_NUM_SEEDS", 5)),
+                    n_env=int(config.get("TEST_NUM_ENVS", 128)),
+                    n_steps=int(config.get("TEST_NUM_STEPS", 128)),
+                    greedy_fn=greedy_fn,
+                    dict_to_agent_array=dict_to_agent_array,
+                )
+
+            rng, rng_eval = jax.random.split(rng)
+            new_test_state = jax.lax.cond(
+                (update_index + 1) % eval_interval == 0,
+                lambda: _run_eval(rng_eval),
+                lambda: test_state,
+            )
+
             # --- METRICS & LOGGING ---
             metrics = {
                 "loss": loss.mean(),
@@ -408,13 +451,31 @@ def make_train(config: dict):
                 ),
                 "returned_episode": jnp.mean(traj_batch.info["returned_episode"]),
             }
+            for k in test_template:
+                arr = new_test_state[k]
+                metrics[f"test_{k}/mean"] = jnp.mean(arr)
+                metrics[f"test_{k}/std"] = jnp.std(arr)
             jax.debug.callback(_log_update, metrics, update_index + 1)
 
-            runner_state = (train_state, env_state, last_obs, last_done, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, rng, new_test_state)
             return runner_state, metrics
 
         # 4. Run All Updates via lax.scan
-        runner_state = (train_state, env_state, last_obs, last_done, rng)
+        n_test_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+        test_template = {
+            "returned_won_episode": jnp.zeros((n_test_seeds,)),
+            "returned_episode_returns": jnp.zeros((n_test_seeds,)),
+            "returned_episode_lengths": jnp.zeros((n_test_seeds,)),
+            "returned_episode": jnp.zeros((n_test_seeds,)),
+        }
+        runner_state = (
+            train_state,
+            env_state,
+            last_obs,
+            last_done,
+            rng,
+            test_template,
+        )
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
@@ -438,8 +499,15 @@ def main(config):
     rng = jax.random.PRNGKey(config.get("SEED", 42))
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
+    final = out["metrics"]
+    print(
+        f"BiCNet on {config['MAP_NAME']} | "
+        f"test win rate: {float(final['test_returned_won_episode/mean'][-1]):.3f} ± "
+        f"{float(final['test_returned_won_episode/std'][-1]):.3f} | "
+        f"test return: {float(final['test_returned_episode_returns/mean'][-1]):.3f} ± "
+        f"{float(final['test_returned_episode_returns/std'][-1]):.3f}"
+    )
     wandb.finish()
-    print("BiCNet training on SMAX 3s5z completed successfully!")
 
 
 if __name__ == "__main__":
