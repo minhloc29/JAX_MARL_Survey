@@ -1163,14 +1163,12 @@ def make_train(config, env):
 
         time_state = {"timesteps": jnp.array(0), "updates": jnp.array(0)}
         n_test_seeds = int(config.get("TEST_NUM_SEEDS", 5))
-        _zero_none = jnp.zeros((n_test_seeds,))
-        test_metrics = {
-            "returns": _zero_none,
-            "returned_won_episode": _zero_none,
-            "returned_episode_returns": _zero_none,
-            "returned_episode_lengths": _zero_none,
-            "returned_episode": _zero_none,
-        }  # initial greedy metrics (per-test-seed)
+        _probe = get_greedy_metrics(
+            jax.random.PRNGKey(0), train_state, time_state
+        )
+        test_metrics = {  # initial greedy metrics (per-test-seed zeros)
+            k[len("test_"):]: jnp.zeros((n_test_seeds,)) for k in _probe
+        }
 
         # train
         rng, _rng = jax.random.split(rng)

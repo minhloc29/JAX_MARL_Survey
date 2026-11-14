@@ -19,8 +19,10 @@ from omegaconf import OmegaConf
 
 import wandb
 from baselines.metrics import (
+    eval_multiseed_scan,
     greedy_eval_rollout_stateful,
     log_metrics,
+    test_means_stds,
 )
 from jaxmarl.environments.smax import HeuristicEnemySMAX, map_name_to_scenario
 from jaxmarl.wrappers.baselines import SMAXLogWrapper
@@ -466,21 +468,25 @@ def make_train(config):
                     dict_to_agent_array=lambda d, a: jnp.stack([d[ag] for ag in a], axis=1),
                 )
 
+            def _run_eval_multiseed(rng):
+                n_seeds = int(config.get("TEST_NUM_SEEDS", 5))
+                return eval_multiseed_scan(
+                    lambda rk: _run_eval(rk), n_seeds, rng
+                )
+
             eval_interval = max(
                 1, int(config.get("TEST_INTERVAL", 0.05) * config["NUM_UPDATES"])
             )
             rng, rng_eval = jax.random.split(rng)
             new_test_state = jax.lax.cond(
                 (update_steps + 1) % eval_interval == 0,
-                lambda: _run_eval(rng_eval),
+                lambda: _run_eval_multiseed(rng_eval),
                 lambda: test_state,
             )
 
             def callback(metric, test_state):
                 log_metrics(
-                    {
-                        "test_" + k: v for k, v in test_state.items()
-                    } | {
+                    test_means_stds(test_state) | {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returned_episode_returns": metric[

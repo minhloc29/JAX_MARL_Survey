@@ -381,13 +381,13 @@ def make_train(config: dict[str, Any]):
                 "rollout/reward_mean": float(batch[6].mean()),
                 "rollout/reward_std": float(batch[6].std()),
                 "rollout/done_rate": float(batch[7].mean()),
-                "returned_won_episode": float(np.asarray(returned_won_episode)[-1].mean()),
-                "returned_episode": float(np.asarray(returned_episode)[-1].mean()),
+                "returned_won_episode": float(np.asarray(batch[12])[-1].mean()),
+                "returned_episode": float(np.asarray(batch[13])[-1].mean()),
                 "returned_episode_returns": float(
-                    np.asarray(returned_episode_returns)[-1].mean()
+                    np.asarray(batch[14])[-1].mean()
                 ),
                 "returned_episode_lengths": float(
-                    np.asarray(returned_episode_lengths)[-1].mean()
+                    np.asarray(batch[15])[-1].mean()
                 ),
                 "exploration/epsilon": float(epsilon_schedule(update * rollout_steps)),
                 "training/update": update + 1,
